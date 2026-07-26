@@ -103,6 +103,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QScrollArea,
     QFrame, QSizePolicy, QLineEdit, QGraphicsOpacityEffect,
+    QStackedWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QPoint
 from PyQt6.QtGui import (
