@@ -1346,7 +1346,7 @@ class HistoryRow(QWidget):
         exists  = Path(path).is_file() if path else False
         is_batch= entry.get('is_batch', False)
 
-        self.setFixedHeight(38)
+        self.setFixedHeight(30 if compact else 38)
         self.setStyleSheet(
             'QWidget{background:transparent;border-bottom:1px solid #0d1f35;}'
             'QWidget:hover{background:#0b1628;}')
@@ -1570,10 +1570,10 @@ class MainWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self._opacity = 0.75
         self.setWindowOpacity(self._opacity)
-        self.setFixedSize(700, 580)
+        self.setFixedSize(700, 700)
         self.setStyleSheet(APP_STYLE)
         screen = QApplication.primaryScreen().geometry()
-        self.move((screen.width()-700)//2, (screen.height()-580)//2)
+        self.move((screen.width()-700)//2, (screen.height()-700)//2)
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -1698,34 +1698,6 @@ class MainWindow(QWidget):
         placeholder.setStyleSheet("color: #2a3f58; font-family: Consolas; font-size: 12px;")
         self.log_layout.addWidget(placeholder)
         inner.addWidget(self.log_frame)
-
-        # ── Compact History Panel ─────────────────────────
-        hist_hdr_row = QHBoxLayout()
-        hist_hdr_row.setContentsMargins(0, 4, 0, 0)
-        hist_hdr_lbl = QLabel("Riwayat")
-        hist_hdr_lbl.setStyleSheet(
-            "color:#2a3f58;font-size:10px;letter-spacing:2px;background:transparent;")
-        hist_hdr_row.addWidget(hist_hdr_lbl)
-        hist_hdr_row.addStretch()
-        see_all_btn = QPushButton("Lihat semua")
-        see_all_btn.setFixedHeight(20)
-        see_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        see_all_btn.setStyleSheet(
-            "QPushButton{background:transparent;color:#2a3f58;border:none;"
-            "font-size:10px;font-family:Consolas;}"
-            "QPushButton:hover{color:#00dcb4;}")
-        see_all_btn.clicked.connect(self._show_history_overlay)
-        hist_hdr_row.addWidget(see_all_btn)
-        inner.addLayout(hist_hdr_row)
-
-        self.history_frame = QFrame()
-        self.history_frame.setStyleSheet(
-            "QFrame{background:#0b1628;border:1px solid #162b47;border-radius:6px;}")
-        self.history_lo = QVBoxLayout(self.history_frame)
-        self.history_lo.setContentsMargins(0, 0, 0, 0)
-        self.history_lo.setSpacing(0)
-        inner.addWidget(self.history_frame)
-        self._refresh_compact_history()
 
         # Results panel (hidden until scan done)
         self.results_panel = QWidget()
@@ -1923,6 +1895,44 @@ class MainWindow(QWidget):
         scroll.setWidget(content)
         root.addWidget(scroll)
 
+        # ── Fixed history footer ───────────────────────────
+        hist_footer = QWidget()
+        hist_footer.setStyleSheet(
+            "QWidget{background:#040b15;border-top:1px solid #0d1f35;}")
+        hist_footer_lo = QVBoxLayout(hist_footer)
+        hist_footer_lo.setContentsMargins(16, 6, 16, 8)
+        hist_footer_lo.setSpacing(4)
+
+        # Header row
+        hdr_row = QHBoxLayout()
+        hdr_lbl = QLabel("RIWAYAT")
+        hdr_lbl.setStyleSheet(
+            "color:#2a3f58;font-size:9px;font-family:Consolas;letter-spacing:2px;"
+            "background:transparent;border:none;")
+        hdr_row.addWidget(hdr_lbl)
+        hdr_row.addStretch()
+        see_all_btn = QPushButton("Lihat semua ›")
+        see_all_btn.setFixedHeight(18)
+        see_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        see_all_btn.setStyleSheet(
+            "QPushButton{background:transparent;color:#2a3f58;border:none;"
+            "font-size:9px;font-family:Consolas;padding:0;}"
+            "QPushButton:hover{color:#00dcb4;}")
+        see_all_btn.clicked.connect(self._show_history_overlay)
+        hdr_row.addWidget(see_all_btn)
+        hist_footer_lo.addLayout(hdr_row)
+
+        # Entry rows container
+        self.history_frame = QWidget()
+        self.history_frame.setStyleSheet("background:transparent;")
+        self.history_lo = QVBoxLayout(self.history_frame)
+        self.history_lo.setContentsMargins(0, 0, 0, 0)
+        self.history_lo.setSpacing(0)
+        hist_footer_lo.addWidget(self.history_frame)
+
+        root.addWidget(hist_footer)
+        self._refresh_compact_history()
+
     # ── slots ────────────────────────────────────────────
 
     def _browse(self):
@@ -2048,8 +2058,8 @@ class MainWindow(QWidget):
         self._history_overlay = HistoryOverlay(self)
         self._history_overlay._entries = _load_history()
         self._history_overlay._render(self._history_overlay._entries)
+        # Cover full window minus titlebar; overlay is inside the window
         self._history_overlay.setGeometry(0, 48, self.width(), self.height() - 48)
-        self._history_overlay.closed.connect(lambda: None)
         self._history_overlay.do_open.connect(self._open_report_file)
         self._history_overlay.do_rescan.connect(self._do_rescan)
         self._history_overlay.show()
