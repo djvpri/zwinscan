@@ -922,6 +922,8 @@ class BatchScanWorker(QThread):
     file_done           = pyqtSignal(str, list, str)     # path, findings, html_out
     batch_done          = pyqtSignal(list)               # [(path, findings, html_out), ...]
     batch_error         = pyqtSignal(str)
+    ai_summary_done     = pyqtSignal(dict)
+    ai_error            = pyqtSignal(str)
 
     def __init__(self, targets: list, api_key: str = ''):
         super().__init__()
@@ -984,6 +986,19 @@ class BatchScanWorker(QThread):
             batch_html = ''
 
         self.batch_done.emit(results)
+
+        # ── AI Executive Summary (aggregated) ────────────
+        if self.api_key and HAS_GENAI and results:
+            try:
+                all_findings = [f for _, findings, _ in results for f in findings]
+                file_count   = len([r for r in results if r[1]])
+                exe_name     = f'Batch ({file_count} file)'
+                total_size   = ''
+                result = ai_executive_summary(self.api_key, all_findings, exe_name, total_size)
+                self.ai_summary_done.emit(result)
+            except Exception as e:
+                log.warning(f'Batch AI summary error: {e}')
+                self.ai_error.emit(str(e))
 
 
 class ChatWorker(QThread):
@@ -2209,6 +2224,8 @@ class MainWindow(QWidget):
         self._batch_worker.file_module_done.connect(self._on_module_done)
         self._batch_worker.file_done.connect(self._on_batch_file_done)
         self._batch_worker.batch_done.connect(self._on_batch_done)
+        self._batch_worker.ai_summary_done.connect(self._on_ai_summary)
+        self._batch_worker.ai_error.connect(lambda e: log.warning(f'Batch AI: {e}'))
         self._batch_worker.start()
 
     def _on_module_started(self, name: str):
@@ -2309,6 +2326,19 @@ class MainWindow(QWidget):
         })
         self._refresh_compact_history()
         self._tab_hist.setText(f'RIWAYAT  {len(_load_history())}')
+
+        # ── AI panel & chat untuk batch ──
+        all_findings = [f for _, findings, _ in results for f in findings]
+        lines = [f'[{f.severity}] {f.category}: {f.title}' for f in all_findings]
+        self._chat_context = (
+            f'Batch scan: {len(results)} file\n'
+            f'Total findings ({len(all_findings)}):\n' + '\n'.join(lines)
+        )
+        if self._api_key and HAS_GENAI:
+            self.ai_panel.setVisible(True)
+            self.ai_verdict_lbl.setText("⟳ Menunggu AI Executive Summary batch…")
+            if self._api_key:
+                self.chat_panel.setVisible(True)
 
     def _open_batch_report(self):
         if hasattr(self, '_batch_report_path') and Path(self._batch_report_path).is_file():
