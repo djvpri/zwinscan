@@ -65,7 +65,9 @@ except ImportError:
     HAS_GENAI = False
 
 # ── config helpers ─────────────────────────────────────────
-_CONFIG_FILE = _LOG_DIR / 'config.json'
+_CONFIG_FILE  = _LOG_DIR / 'config.json'
+_HISTORY_FILE = _LOG_DIR / 'history.json'
+_MAX_HISTORY  = 50
 
 def _load_config() -> dict:
     try: return json.loads(_CONFIG_FILE.read_text(encoding='utf-8'))
@@ -74,10 +76,33 @@ def _load_config() -> dict:
 def _save_config(cfg: dict):
     _CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
 
+def _load_history() -> list:
+    try: return json.loads(_HISTORY_FILE.read_text(encoding='utf-8'))
+    except: return []
+
+def _save_history(entries: list):
+    _HISTORY_FILE.write_text(
+        json.dumps(entries[:_MAX_HISTORY], ensure_ascii=False, indent=2), encoding='utf-8')
+
+def _append_history(entry: dict):
+    entries = _load_history()
+    # Hindari duplikat scan dalam 5 menit untuk file yang sama
+    if entries and entries[0].get('path') == entry.get('path'):
+        prev_ts = entries[0].get('timestamp','')
+        try:
+            prev = datetime.datetime.strptime(prev_ts, '%Y-%m-%d %H:%M:%S')
+            if (datetime.datetime.now() - prev).seconds < 300:
+                entries[0] = entry  # timpa entry terbaru
+                _save_history(entries)
+                return
+        except: pass
+    entries.insert(0, entry)
+    _save_history(entries)
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QScrollArea,
-    QFrame, QSizePolicy, QLineEdit,
+    QFrame, QSizePolicy, QLineEdit, QGraphicsOpacityEffect,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QPoint
 from PyQt6.QtGui import (
@@ -666,6 +691,135 @@ r()
 
 
 # =========================================================
+# Batch HTML Report
+# =========================================================
+
+def save_batch_html(results: list, out: str):
+    """Laporan gabungan semua exe dalam batch scan."""
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    SEV = ['CRITICAL','HIGH','MEDIUM','LOW','INFO']
+
+    # Serialisasi data sebagai JSON murni — tidak ada masalah escaping
+    files_data = []
+    for path, findings, html_out in results:
+        name = Path(path).name
+        try: size = f'{Path(path).stat().st_size/1_048_576:.1f} MB'
+        except: size = '?'
+        counts = {s: sum(1 for f in findings if f.severity == s) for s in SEV}
+        risk   = counts['CRITICAL']*10 + counts['HIGH']*4 + counts['MEDIUM']*2 + counts['LOW']
+        files_data.append({
+            'name': name, 'size': size, 'risk': risk, 'counts': counts,
+            'report': str(html_out),
+            'findings': [{'s': f.severity, 'c': f.category,
+                          't': f.title, 'd': f.detail[:300]} for f in findings],
+        })
+    files_json = json.dumps(files_data, ensure_ascii=False)
+    total_findings = sum(len(f) for _, f, _ in results)
+
+    html = f"""<!DOCTYPE html><html lang="id"><head><meta charset="UTF-8">
+<title>ZWinScan — Batch Report ({len(results)} files)</title>
+<style>
+:root{{--bg:#050d1a;--sf:#0b1628;--ev:#101f35;--br:#162b47;--bh:#1e3a5f;
+  --tx:#c8d8e8;--td:#4a6580;--tm:#2a3f58;--ac:#00dcb4;
+  --fm:'Consolas','SF Mono',monospace;--r:6px}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+html,body{{min-height:100%;background:var(--bg);color:var(--tx);font-family:system-ui,sans-serif;font-size:14px}}
+.bar{{position:sticky;top:0;height:50px;background:rgba(5,13,26,.96);border-bottom:1px solid var(--br);
+  display:flex;align-items:center;gap:16px;padding:0 24px;z-index:99;backdrop-filter:blur(8px)}}
+.logo{{font-family:var(--fm);font-size:14px;font-weight:700;color:var(--ac)}}
+.meta{{margin-left:auto;font-family:var(--fm);font-size:11px;color:var(--td)}}
+.wrap{{max-width:1100px;margin:0 auto;padding:28px 24px}}
+.summary{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:28px}}
+.sc{{background:var(--sf);border:1px solid var(--br);border-radius:var(--r);padding:16px;text-align:center}}
+.sc b{{font-family:var(--fm);font-size:28px;font-weight:700;display:block}}
+.sc span{{font-size:10px;color:var(--td);letter-spacing:.05em}}
+.tbl{{width:100%;border-collapse:collapse;margin-bottom:28px}}
+.tbl th{{background:var(--ev);color:var(--td);font-size:10px;letter-spacing:.08em;
+  text-align:left;padding:8px 12px;border-bottom:1px solid var(--br)}}
+.tbl td{{padding:10px 12px;border-bottom:1px solid #0d1f35;vertical-align:middle}}
+.tbl tr:hover td{{background:var(--sf)}}
+.pill{{display:inline-block;font-family:var(--fm);font-size:10px;font-weight:700;
+  padding:2px 7px;border-radius:3px;margin:0 2px}}
+.det{{display:none;background:var(--sf);border:1px solid var(--br);border-radius:var(--r);margin:0 0 12px}}
+.det.on{{display:block}}
+.fi{{border-bottom:1px solid #0d1f35;padding:10px 16px;display:flex;gap:10px;align-items:baseline}}
+.fi:last-child{{border-bottom:none}}
+.fs{{font-family:var(--fm);font-size:10px;font-weight:700;flex-shrink:0;width:60px}}
+.fc{{font-family:var(--fm);font-size:10px;color:var(--td);background:var(--ev);
+  border-radius:3px;padding:1px 6px;flex-shrink:0}}
+.ft{{font-size:12px;flex:1}}
+.fd{{font-family:var(--fm);font-size:11px;color:var(--td);margin-top:4px;white-space:pre-wrap;word-break:break-all}}
+::-webkit-scrollbar{{width:4px}}::-webkit-scrollbar-thumb{{background:var(--bh);border-radius:2px}}
+</style></head><body>
+<div class="bar">
+  <div class="logo">ZWinScan · Batch</div>
+  <span style="font-family:var(--fm);font-size:12px;color:var(--td)">{len(results)} file · {total_findings} findings</span>
+  <div class="meta">{now}</div>
+</div>
+<div class="wrap">
+  <div class="summary" id="sum"></div>
+  <table class="tbl">
+    <thead><tr>
+      <th>#</th><th>File</th><th>Size</th>
+      <th style="color:#f03737">CRIT</th><th style="color:#f87325">HIGH</th>
+      <th style="color:#d4a017">MED</th><th style="color:#3b8cf8">LOW</th>
+      <th>INFO</th><th>Risk</th><th></th>
+    </tr></thead>
+    <tbody id="tb"></tbody>
+  </table>
+  <div id="details"></div>
+</div>
+<script id="jd" type="application/json">{files_json}</script>
+<script>
+const SC={{'CRITICAL':'#f03737','HIGH':'#f87325','MEDIUM':'#d4a017','LOW':'#3b8cf8','INFO':'#3d5570'}};
+const FILES=JSON.parse(document.getElementById('jd').textContent);
+function pill(s,n){{return n?`<span class="pill" style="background:${{SC[s]}}22;color:${{SC[s]}}">${{n}}</span>`:'-'}}
+function riskColor(r){{return r>=30?'#f03737':r>=10?'#f87325':r>=4?'#d4a017':'#00dcb4'}}
+const tots={{}};
+FILES.forEach(f=>Object.keys(f.counts).forEach(s=>tots[s]=(tots[s]||0)+f.counts[s]));
+const sum=document.getElementById('sum');
+['CRITICAL','HIGH','MEDIUM','LOW'].forEach(s=>{{
+  sum.innerHTML+=`<div class="sc"><b style="color:${{SC[s]}}">${{tots[s]||0}}</b><span>${{s}}</span></div>`;
+}});
+const tb=document.getElementById('tb');
+FILES.forEach((f,i)=>{{
+  const tr=document.createElement('tr');
+  tr.style.cursor='pointer';
+  tr.innerHTML=`<td style="color:var(--tm);font-family:var(--fm)">${{i+1}}</td>
+    <td style="font-family:var(--fm);font-size:12px">${{f.name}}</td>
+    <td style="color:var(--td);font-size:11px">${{f.size}}</td>
+    <td>${{pill('CRITICAL',f.counts.CRITICAL)}}</td>
+    <td>${{pill('HIGH',f.counts.HIGH)}}</td>
+    <td>${{pill('MEDIUM',f.counts.MEDIUM)}}</td>
+    <td>${{pill('LOW',f.counts.LOW)}}</td>
+    <td style="color:var(--tm);font-family:var(--fm);font-size:11px">${{f.counts.INFO||0}}</td>
+    <td><b style="font-family:var(--fm);color:${{riskColor(f.risk)}}">${{f.risk}}</b></td>
+    <td><a href="${{f.report}}" onclick="event.stopPropagation()"
+       style="color:var(--ac);font-size:11px;text-decoration:none" target="_blank">→ Detail</a></td>`;
+  tr.onclick=()=>toggleDetail(i,f);
+  tb.appendChild(tr);
+}});
+const detDiv=document.getElementById('details');
+function toggleDetail(i,f){{
+  let d=document.getElementById('det'+i);
+  if(!d){{
+    d=document.createElement('div');d.id='det'+i;d.className='det';
+    const rows=f.findings.length?f.findings.map(fi=>{{
+      const col=SC[fi.s]||'#3d5570';
+      return `<div class="fi"><span class="fs" style="color:${{col}}">${{fi.s}}</span>`+
+        `<span class="fc">${{fi.c}}</span>`+
+        `<div><div class="ft">${{fi.t}}</div>`+
+        `${{fi.d?'<div class="fd">'+fi.d+'</div>':''}}</div></div>`;
+    }}).join(''):'<div style="padding:16px;color:var(--tm);font-family:var(--fm)">Tidak ada findings.</div>';
+    d.innerHTML=rows;detDiv.appendChild(d);
+  }}
+  d.classList.toggle('on');
+}}
+</script></body></html>"""
+    Path(out).write_text(html, encoding='utf-8')
+
+
+# =========================================================
 # Worker Thread
 # =========================================================
 
@@ -757,6 +911,78 @@ class ScanWorker(QThread):
         except Exception:
             log.error(f'Scan thread exception:\n{traceback.format_exc()}')
             self.scan_done.emit([], '')
+
+
+class BatchScanWorker(QThread):
+    """Scan semua .exe dalam daftar secara berurutan."""
+    file_started        = pyqtSignal(str, int, int)      # name, current, total
+    file_module_started = pyqtSignal(str)
+    file_module_done    = pyqtSignal(str, int, float)
+    file_done           = pyqtSignal(str, list, str)     # path, findings, html_out
+    batch_done          = pyqtSignal(list)               # [(path, findings, html_out), ...]
+    batch_error         = pyqtSignal(str)
+
+    def __init__(self, targets: list, api_key: str = ''):
+        super().__init__()
+        self.targets = targets
+        self.api_key = api_key
+
+    def run(self):
+        log.info(f'Batch scan: {len(self.targets)} files')
+        results = []
+        MODULES = [
+            ('PE Security Flags', 'check_pe_flags'),
+            ('Import Table',      'check_imports'),
+            ('Section Entropy',   'check_section_entropy'),
+            ('Compile Timestamp', 'check_compile_timestamp'),
+            ('Digital Signature', 'check_signature'),
+            ('UAC & Manifest',    'check_uac_manifest'),
+            ('Hardcoded Secrets', 'check_hardcoded_secrets'),
+            ('URL & Network',     'check_urls'),
+            ('Network / SSO',     'check_network'),
+            ('Credential Files',  'check_credential_files'),
+        ]
+        for idx, target in enumerate(self.targets):
+            name = Path(target).name
+            self.file_started.emit(name, idx + 1, len(self.targets))
+            log.info(f'Batch [{idx+1}/{len(self.targets)}]: {target}')
+            try:
+                scanner = ZWinScanner(target)
+                t0 = time.time()
+                prev = 0
+                for mod_name, method in MODULES:
+                    self.file_module_started.emit(mod_name)
+                    tm = time.time()
+                    getattr(scanner, method)()
+                    n = len(scanner.findings) - prev
+                    prev = len(scanner.findings)
+                    self.file_module_done.emit(mod_name, n, time.time() - tm)
+
+                duration = f'{time.time() - t0:.1f}s'
+                exe_name = Path(target).stem
+                html_out = str(Path(target).parent / f'zwinscan_{exe_name}_report.html')
+                try:
+                    save_html(scanner.findings, target, html_out, duration)
+                except PermissionError:
+                    html_out = str(_LOG_DIR / f'zwinscan_{exe_name}_report.html')
+                    save_html(scanner.findings, target, html_out, duration)
+
+                results.append((target, scanner.findings, html_out))
+                self.file_done.emit(target, scanner.findings, html_out)
+            except Exception:
+                log.error(f'Batch error on {target}:\n{traceback.format_exc()}')
+                results.append((target, [], ''))
+                self.file_done.emit(target, [], '')
+
+        # Combined report
+        try:
+            batch_html = str(_LOG_DIR / 'zwinscan_batch_report.html')
+            save_batch_html(results, batch_html)
+        except Exception as e:
+            log.error(f'save_batch_html error: {e}')
+            batch_html = ''
+
+        self.batch_done.emit(results)
 
 
 class ChatWorker(QThread):
@@ -961,11 +1187,21 @@ class DropZone(QWidget):
         self.line2.setStyleSheet("color: #4a6580; font-size: 11px;")
         self.update()
 
+    def set_folder(self, folder: str, count: int):
+        self._has_file = True
+        self.icon.setText("📁")
+        self.icon.setStyleSheet("color: #00dcb4; font-size: 24px;")
+        self.line1.setText(Path(folder).name)
+        self.line1.setStyleSheet("color: #c8d8e8; font-size: 13px; font-weight: 600; font-family: Consolas;")
+        self.line2.setText(f"{count} file .exe ditemukan  ·  Batch scan siap")
+        self.line2.setStyleSheet("color: #4a6580; font-size: 11px;")
+        self.update()
+
     def reset(self):
         self._has_file = False
         self.icon.setText("↓")
         self.icon.setStyleSheet("color: #2a3f58; font-size: 30px;")
-        self.line1.setText("Drop .exe file here")
+        self.line1.setText("Drop .exe atau folder di sini")
         self.line1.setStyleSheet("color: #4a6580; font-size: 14px; font-weight: 500;")
         self.line2.setText("atau klik Browse untuk memilih")
         self.line2.setStyleSheet("color: #2a3f58; font-size: 11px;")
@@ -974,7 +1210,8 @@ class DropZone(QWidget):
     def dragEnterEvent(self, e: QDragEnterEvent):
         if e.mimeData().hasUrls():
             urls = e.mimeData().urls()
-            if urls and urls[0].toLocalFile().lower().endswith('.exe'):
+            p = urls[0].toLocalFile() if urls else ''
+            if p.lower().endswith('.exe') or Path(p).is_dir():
                 e.acceptProposedAction()
                 self._drag_over = True
                 self.line1.setText("Lepaskan di sini")
@@ -993,7 +1230,7 @@ class DropZone(QWidget):
         urls = e.mimeData().urls()
         if urls:
             path = urls[0].toLocalFile()
-            if path.lower().endswith('.exe'):
+            if path.lower().endswith('.exe') or Path(path).is_dir():
                 self.file_dropped.emit(path)
         self.update()
 
@@ -1088,20 +1325,242 @@ class SeverityCard(QFrame):
 
 
 # =========================================================
+# History Widgets
+# =========================================================
+
+SEV_BADGE = {'CRITICAL':('#f03737','C'),'HIGH':('#f87325','H'),
+             'MEDIUM':('#d4a017','M'),'LOW':('#3b8cf8','L')}
+
+class HistoryRow(QWidget):
+    open_report = pyqtSignal(str)
+    rescan      = pyqtSignal(str)
+
+    def __init__(self, entry: dict, compact: bool = True):
+        super().__init__()
+        self._entry = entry
+        path    = entry.get('path','')
+        name    = entry.get('name', Path(path).name if path else '?')
+        ts      = entry.get('timestamp','')[:16]
+        counts  = entry.get('counts', {})
+        report  = entry.get('report','')
+        exists  = Path(path).is_file() if path else False
+        is_batch= entry.get('is_batch', False)
+
+        self.setFixedHeight(38)
+        self.setStyleSheet(
+            'QWidget{background:transparent;border-bottom:1px solid #0d1f35;}'
+            'QWidget:hover{background:#0b1628;}')
+        lo = QHBoxLayout(self)
+        lo.setContentsMargins(12, 0, 8, 0)
+        lo.setSpacing(6)
+
+        # Icon
+        ico = QLabel('📁' if is_batch else ('●' if exists else '○'))
+        ico.setStyleSheet(f'font-size:11px;color:{"#00dcb4" if exists else "#2a3f58"};'
+                          'background:transparent;border:none;')
+        ico.setFixedWidth(16)
+        lo.addWidget(ico)
+
+        # Name
+        name_lbl = QLabel(name[:28] + ('…' if len(name)>28 else ''))
+        name_lbl.setStyleSheet(
+            f'font-family:Consolas;font-size:11px;'
+            f'color:{"#c8d8e8" if exists else "#4a6580"};'
+            'background:transparent;border:none;')
+        name_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        lo.addWidget(name_lbl)
+
+        # Timestamp
+        ts_lbl = QLabel(ts[5:] if compact else ts)  # show MM-DD HH:MM in compact
+        ts_lbl.setStyleSheet('color:#2a3f58;font-family:Consolas;font-size:10px;'
+                             'background:transparent;border:none;')
+        ts_lbl.setFixedWidth(85 if compact else 110)
+        lo.addWidget(ts_lbl)
+
+        # Severity badges (non-zero only)
+        for sev, (col, ltr) in SEV_BADGE.items():
+            n = counts.get(sev, 0)
+            if n:
+                b = QLabel(f'{n}{ltr}')
+                b.setStyleSheet(
+                    f'color:{col};font-family:Consolas;font-size:9px;font-weight:700;'
+                    f'background:rgba({int(col[1:3],16)},{int(col[3:5],16)},'
+                    f'{int(col[5:],16)},30);border:1px solid {col};'
+                    'border-radius:3px;padding:0 4px;background:transparent;border:none;')
+                lo.addWidget(b)
+
+        # Trending badge
+        trend = entry.get('trend')
+        if trend == 'up':
+            tl = QLabel('↑'); tl.setStyleSheet('color:#f03737;font-size:11px;background:transparent;border:none;')
+            lo.addWidget(tl)
+        elif trend == 'down':
+            tl = QLabel('↓'); tl.setStyleSheet('color:#00dcb4;font-size:11px;background:transparent;border:none;')
+            lo.addWidget(tl)
+
+        # Open report button
+        if report and Path(report).is_file():
+            btn_open = QPushButton('→')
+            btn_open.setFixedSize(24, 24)
+            btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_open.setStyleSheet('QPushButton{background:transparent;color:#00dcb4;'
+                                   'border:none;font-size:13px;}'
+                                   'QPushButton:hover{color:#c8d8e8;}')
+            btn_open.clicked.connect(lambda: self.open_report.emit(report))
+            lo.addWidget(btn_open)
+
+        # Rescan button
+        if exists:
+            btn_re = QPushButton('↺')
+            btn_re.setFixedSize(24, 24)
+            btn_re.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_re.setStyleSheet('QPushButton{background:transparent;color:#4a6580;'
+                                 'border:none;font-size:13px;}'
+                                 'QPushButton:hover{color:#00dcb4;}')
+            btn_re.clicked.connect(lambda: self.rescan.emit(path))
+            lo.addWidget(btn_re)
+
+
+class HistoryOverlay(QWidget):
+    """Overlay penuh — daftar semua history + search."""
+    closed   = pyqtSignal()
+    do_open  = pyqtSignal(str)
+    do_rescan= pyqtSignal(str)
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setGeometry(0, 48, parent.width(), parent.height() - 48)
+        self.setStyleSheet('background:#050d1a;')
+        self._entries = _load_history()
+        self._build()
+        self.raise_()
+
+    def _build(self):
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(20, 16, 20, 16)
+        lo.setSpacing(10)
+
+        # Header row
+        hdr = QHBoxLayout()
+        title = QLabel('Riwayat Scan')
+        title.setStyleSheet('color:#c8d8e8;font-size:13px;font-weight:700;')
+        hdr.addWidget(title)
+        hdr.addStretch()
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText('Cari nama file…')
+        self._search.setFixedWidth(180)
+        self._search.setFixedHeight(28)
+        self._search.setStyleSheet(
+            'QLineEdit{background:#0b1628;border:1px solid #162b47;border-radius:5px;'
+            'color:#c8d8e8;font-family:Consolas;font-size:11px;padding:2px 8px;}'
+            'QLineEdit:focus{border-color:#1e3a5f;}')
+        self._search.textChanged.connect(self._filter)
+        hdr.addWidget(self._search)
+
+        close_btn = QPushButton('✕')
+        close_btn.setFixedSize(28, 28)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet('QPushButton{background:#0b1628;border:1px solid #162b47;'
+                                'border-radius:5px;color:#4a6580;font-size:12px;}'
+                                'QPushButton:hover{color:#f03737;border-color:#f03737;}')
+        close_btn.clicked.connect(self._close)
+        hdr.addWidget(close_btn)
+        lo.addLayout(hdr)
+
+        # Stats label
+        self._stats = QLabel(f'{len(self._entries)} scan tersimpan')
+        self._stats.setStyleSheet('color:#2a3f58;font-family:Consolas;font-size:10px;')
+        lo.addWidget(self._stats)
+
+        # Scroll list
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet('QScrollArea{border:1px solid #162b47;border-radius:6px;'
+                             'background:#0b1628;}')
+        self._list_widget = QWidget()
+        self._list_widget.setStyleSheet('background:#0b1628;')
+        self._list_lo = QVBoxLayout(self._list_widget)
+        self._list_lo.setContentsMargins(0,0,0,0)
+        self._list_lo.setSpacing(0)
+        scroll.setWidget(self._list_widget)
+        lo.addWidget(scroll)
+
+        # Clear history button
+        clear_btn = QPushButton('Hapus semua history')
+        clear_btn.setFixedHeight(32)
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setStyleSheet('QPushButton{background:transparent;color:#2a3f58;'
+                                'border:1px solid #162b47;border-radius:5px;font-size:11px;}'
+                                'QPushButton:hover{color:#f03737;border-color:#f03737;}')
+        clear_btn.clicked.connect(self._clear_history)
+        lo.addWidget(clear_btn)
+
+        self._render(self._entries)
+
+    def _render(self, entries):
+        while self._list_lo.count():
+            item = self._list_lo.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        if not entries:
+            empty = QLabel('Belum ada riwayat scan.')
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setFixedHeight(60)
+            empty.setStyleSheet('color:#2a3f58;font-family:Consolas;font-size:12px;')
+            self._list_lo.addWidget(empty)
+            return
+        for e in entries:
+            row = HistoryRow(e, compact=False)
+            row.open_report.connect(self.do_open)
+            row.rescan.connect(self._rescan)
+            self._list_lo.addWidget(row)
+        self._list_lo.addStretch()
+
+    def _filter(self, text):
+        q = text.lower()
+        filtered = [e for e in self._entries if q in e.get('name','').lower()] if q else self._entries
+        self._stats.setText(f'{len(filtered)} dari {len(self._entries)} scan')
+        self._render(filtered)
+
+    def _rescan(self, path):
+        self.do_rescan.emit(path)
+        self._close()
+
+    def _clear_history(self):
+        _save_history([])
+        self._entries = []
+        self._stats.setText('0 scan tersimpan')
+        self._render([])
+
+    def _close(self):
+        self.closed.emit()
+        self.hide()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self._close()
+
+
+# =========================================================
 # Main Window
 # =========================================================
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self._target      = ''
-        self._worker      = None
-        self._chat_worker = None
-        self._mod_rows    = {}
-        self._html_out    = ''
-        self._findings    = []
-        self._chat_history = []
-        self._chat_context = ''
+        self._target       = ''
+        self._batch_targets= []
+        self._worker       = None
+        self._batch_worker = None
+        self._chat_worker  = None
+        self._mod_rows     = {}
+        self._html_out     = ''
+        self._findings     = []
+        self._chat_history  = []
+        self._chat_context  = ''
+        self._scan_start_time = 0.0
+        self._history_overlay = None
         cfg = _load_config()
         self._api_key = cfg.get('gemini_api_key', '')
         self._setwindow()
@@ -1159,13 +1618,20 @@ class MainWindow(QWidget):
         """)
         self.path_edit.returnPressed.connect(self._on_path_entered)
         browse = QPushButton("Browse")
-        browse.setFixedWidth(88)
+        browse.setFixedWidth(80)
         browse.setFixedHeight(34)
         browse.setCursor(Qt.CursorShape.PointingHandCursor)
         browse.setStyleSheet(BROWSE_BTN_STYLE)
         browse.clicked.connect(self._browse)
+        browse_folder = QPushButton("📁 Folder")
+        browse_folder.setFixedWidth(84)
+        browse_folder.setFixedHeight(34)
+        browse_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        browse_folder.setStyleSheet(BROWSE_BTN_STYLE)
+        browse_folder.clicked.connect(self._browse_folder)
         path_row.addWidget(self.path_edit)
         path_row.addWidget(browse)
+        path_row.addWidget(browse_folder)
         inner.addLayout(path_row)
 
         # API Key row
@@ -1177,12 +1643,8 @@ class MainWindow(QWidget):
         self.key_edit = QLineEdit(self._api_key)
         self.key_edit.setPlaceholderText("Gemini API Key (opsional — untuk analisis AI)")
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_edit.setStyleSheet("""
-            QLineEdit { background:#0b1628; border:1px solid #162b47; border-radius:6px;
-                        color:#7a9ab8; font-family:Consolas; font-size:11px; padding:6px 10px; }
-            QLineEdit:focus { border-color:#1e3a5f; color:#c8d8e8; }
-        """)
         self.key_edit.textChanged.connect(self._on_key_changed)
+
         self._key_eye = QPushButton("👁")
         self._key_eye.setFixedSize(30, 30)
         self._key_eye.setStyleSheet("QPushButton{background:#0b1628;border:1px solid #162b47;"
@@ -1190,10 +1652,18 @@ class MainWindow(QWidget):
                                     "QPushButton:hover{color:#c8d8e8;border-color:#3b5070;}")
         self._key_eye.setCursor(Qt.CursorShape.PointingHandCursor)
         self._key_eye.clicked.connect(self._toggle_key_echo)
+
+        self._key_status = QLabel("✓ Tersimpan" if self._api_key else "")
+        self._key_status.setFixedWidth(80)
+        self._key_status.setStyleSheet(
+            "color:#00dcb4;font-family:Consolas;font-size:10px;background:transparent;")
+
         key_row.addWidget(key_lbl)
         key_row.addWidget(self.key_edit)
         key_row.addWidget(self._key_eye)
+        key_row.addWidget(self._key_status)
         inner.addLayout(key_row)
+        self._update_key_style()
 
         # Scan button
         self.scan_btn = QPushButton("SCAN")
@@ -1228,6 +1698,34 @@ class MainWindow(QWidget):
         placeholder.setStyleSheet("color: #2a3f58; font-family: Consolas; font-size: 12px;")
         self.log_layout.addWidget(placeholder)
         inner.addWidget(self.log_frame)
+
+        # ── Compact History Panel ─────────────────────────
+        hist_hdr_row = QHBoxLayout()
+        hist_hdr_row.setContentsMargins(0, 4, 0, 0)
+        hist_hdr_lbl = QLabel("Riwayat")
+        hist_hdr_lbl.setStyleSheet(
+            "color:#2a3f58;font-size:10px;letter-spacing:2px;background:transparent;")
+        hist_hdr_row.addWidget(hist_hdr_lbl)
+        hist_hdr_row.addStretch()
+        see_all_btn = QPushButton("Lihat semua")
+        see_all_btn.setFixedHeight(20)
+        see_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        see_all_btn.setStyleSheet(
+            "QPushButton{background:transparent;color:#2a3f58;border:none;"
+            "font-size:10px;font-family:Consolas;}"
+            "QPushButton:hover{color:#00dcb4;}")
+        see_all_btn.clicked.connect(self._show_history_overlay)
+        hist_hdr_row.addWidget(see_all_btn)
+        inner.addLayout(hist_hdr_row)
+
+        self.history_frame = QFrame()
+        self.history_frame.setStyleSheet(
+            "QFrame{background:#0b1628;border:1px solid #162b47;border-radius:6px;}")
+        self.history_lo = QVBoxLayout(self.history_frame)
+        self.history_lo.setContentsMargins(0, 0, 0, 0)
+        self.history_lo.setSpacing(0)
+        inner.addWidget(self.history_frame)
+        self._refresh_compact_history()
 
         # Results panel (hidden until scan done)
         self.results_panel = QWidget()
@@ -1270,6 +1768,35 @@ class MainWindow(QWidget):
         res_lo.addLayout(btn_row)
 
         inner.addWidget(self.results_panel)
+
+        # ── Batch Results Panel ───────────────────────────
+        self.batch_panel = QWidget()
+        self.batch_panel.setVisible(False)
+        batch_lo = QVBoxLayout(self.batch_panel)
+        batch_lo.setContentsMargins(0, 0, 0, 0)
+        batch_lo.setSpacing(8)
+
+        self.batch_hdr = QLabel("Batch Scan")
+        self.batch_hdr.setStyleSheet("color:#2a3f58;font-size:10px;letter-spacing:2px;")
+        batch_lo.addWidget(self.batch_hdr)
+
+        self.batch_list = QFrame()
+        self.batch_list.setStyleSheet(
+            "QFrame{background:#0b1628;border:1px solid #162b47;border-radius:8px;}")
+        self.batch_list_lo = QVBoxLayout(self.batch_list)
+        self.batch_list_lo.setContentsMargins(0, 0, 0, 0)
+        self.batch_list_lo.setSpacing(0)
+        batch_lo.addWidget(self.batch_list)
+
+        self.batch_report_btn = QPushButton("Buka Laporan Gabungan")
+        self.batch_report_btn.setFixedHeight(42)
+        self.batch_report_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.batch_report_btn.setStyleSheet(OPEN_BTN_STYLE)
+        self.batch_report_btn.setVisible(False)
+        self.batch_report_btn.clicked.connect(self._open_batch_report)
+        batch_lo.addWidget(self.batch_report_btn)
+
+        inner.addWidget(self.batch_panel)
 
         # ── AI Summary Panel ──────────────────────────────
         self.ai_panel = QWidget()
@@ -1403,9 +1930,17 @@ class MainWindow(QWidget):
         if path:
             self._on_file(path)
 
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Pilih folder untuk Batch Scan")
+        if folder:
+            self._on_file(folder)
+
     def _on_path_entered(self):
         path = self.path_edit.text().strip().strip('"').strip("'")
-        if path and Path(path).is_file() and path.lower().endswith('.exe'):
+        p = Path(path)
+        if path and p.is_file() and path.lower().endswith('.exe'):
+            self._on_file(path, update_edit=False)
+        elif path and p.is_dir():
             self._on_file(path, update_edit=False)
         else:
             self.path_edit.setStyleSheet("""
@@ -1415,7 +1950,6 @@ class MainWindow(QWidget):
             """)
 
     def _on_file(self, path: str, update_edit: bool = True):
-        self._target = path
         if update_edit:
             self.path_edit.setText(path)
         self.path_edit.setStyleSheet("""
@@ -1424,15 +1958,63 @@ class MainWindow(QWidget):
                         padding:7px 10px; }
             QLineEdit:focus { border-color: #1e3a5f; }
         """)
-        self.drop.set_file(path)
-        self.scan_btn.setEnabled(True)
         self.results_panel.setVisible(False)
+        self.batch_panel.setVisible(False)
+
+        if Path(path).is_dir():
+            # Cari .exe rekursif maks 4 level, batas 200 file
+            exes = []
+            try:
+                for p in Path(path).rglob('*.exe'):
+                    exes.append(p)
+                    if len(exes) >= 200:
+                        break
+            except PermissionError:
+                pass
+            exes = sorted(exes)
+            if not exes:
+                self.path_edit.setStyleSheet("""
+                    QLineEdit { background:#0b1628; border:1px solid #f03737;
+                                border-radius:6px; color:#c8d8e8;
+                                font-family:Consolas; font-size:11px; padding:7px 10px; }
+                """)
+                self.path_edit.setToolTip("Tidak ada file .exe ditemukan di folder ini")
+                return
+            self.path_edit.setToolTip("")
+            self._batch_targets = [str(e) for e in exes]
+            self._target = ''
+            self.drop.set_folder(path, len(exes))
+            self.scan_btn.setText(f"BATCH SCAN ({len(exes)} file)")
+            self.scan_btn.setEnabled(True)
+        else:
+            self._target = path
+            self._batch_targets = []
+            self.drop.set_file(path)
+            self.scan_btn.setText("SCAN")
+            self.scan_btn.setEnabled(True)
 
     def _on_key_changed(self, text: str):
         self._api_key = text.strip()
         cfg = _load_config()
         cfg['gemini_api_key'] = self._api_key
         _save_config(cfg)
+        self._update_key_style()
+
+    def _update_key_style(self):
+        if self._api_key:
+            self.key_edit.setStyleSheet("""
+                QLineEdit { background:#0b1628; border:1px solid #00dcb430; border-radius:6px;
+                            color:#7a9ab8; font-family:Consolas; font-size:11px; padding:6px 10px; }
+                QLineEdit:focus { border-color:#00dcb4; color:#c8d8e8; }
+            """)
+            self._key_status.setText("✓ Tersimpan")
+        else:
+            self.key_edit.setStyleSheet("""
+                QLineEdit { background:#0b1628; border:1px solid #162b47; border-radius:6px;
+                            color:#7a9ab8; font-family:Consolas; font-size:11px; padding:6px 10px; }
+                QLineEdit:focus { border-color:#1e3a5f; color:#c8d8e8; }
+            """)
+            self._key_status.setText("")
 
     def _toggle_key_echo(self):
         if self.key_edit.echoMode() == QLineEdit.EchoMode.Password:
@@ -1440,19 +2022,64 @@ class MainWindow(QWidget):
         else:
             self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
 
+    # ── History helpers ──────────────────────────────────
+
+    def _refresh_compact_history(self):
+        while self.history_lo.count():
+            item = self.history_lo.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        entries = _load_history()[:5]
+        if not entries:
+            ph = QLabel("Belum ada riwayat scan.")
+            ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            ph.setFixedHeight(36)
+            ph.setStyleSheet("color:#2a3f58;font-family:Consolas;font-size:11px;")
+            self.history_lo.addWidget(ph)
+            return
+        for e in entries:
+            row = HistoryRow(e, compact=True)
+            row.open_report.connect(self._open_report_file)
+            row.rescan.connect(self._do_rescan)
+            self.history_lo.addWidget(row)
+
+    def _show_history_overlay(self):
+        if self._history_overlay:
+            self._history_overlay.deleteLater()
+        self._history_overlay = HistoryOverlay(self)
+        self._history_overlay._entries = _load_history()
+        self._history_overlay._render(self._history_overlay._entries)
+        self._history_overlay.setGeometry(0, 48, self.width(), self.height() - 48)
+        self._history_overlay.closed.connect(lambda: None)
+        self._history_overlay.do_open.connect(self._open_report_file)
+        self._history_overlay.do_rescan.connect(self._do_rescan)
+        self._history_overlay.show()
+
+    def _open_report_file(self, path: str):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _do_rescan(self, path: str):
+        self._on_file(path)
+
+    # ── Scan starters ────────────────────────────────────
+
     def _start_scan(self):
+        if self._batch_targets:
+            self._start_batch_scan()
+            return
         if not self._target or not Path(self._target).is_file():
             return
 
         self.scan_btn.setEnabled(False)
         self.scan_btn.setText("Scanning…")
         self.results_panel.setVisible(False)
+        self.batch_panel.setVisible(False)
         self.ai_panel.setVisible(False)
         self.ai_str_panel.setVisible(False)
         self.chat_panel.setVisible(False)
         self._mod_rows.clear()
         self._findings.clear()
         self._chat_history.clear()
+        self._scan_start_time = time.time()
 
         # Clear log
         while self.log_layout.count():
@@ -1469,6 +2096,34 @@ class MainWindow(QWidget):
         self._worker.ai_error.connect(lambda e: log.warning(f'AI: {e}'))
         self._worker.start()
 
+    def _start_batch_scan(self):
+        self.scan_btn.setEnabled(False)
+        self.scan_btn.setText("Scanning…")
+        self.results_panel.setVisible(False)
+        self.batch_panel.setVisible(False)
+        self.ai_panel.setVisible(False)
+        self.ai_str_panel.setVisible(False)
+        self.chat_panel.setVisible(False)
+        self._mod_rows.clear()
+        self._scan_start_time = time.time()
+
+        while self.log_layout.count():
+            item = self.log_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        while self.batch_list_lo.count():
+            item = self.batch_list_lo.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        self._batch_report_path = ''
+
+        self._batch_worker = BatchScanWorker(self._batch_targets, self._api_key)
+        self._batch_worker.file_started.connect(self._on_batch_file_started)
+        self._batch_worker.file_module_started.connect(self._on_module_started)
+        self._batch_worker.file_module_done.connect(self._on_module_done)
+        self._batch_worker.file_done.connect(self._on_batch_file_done)
+        self._batch_worker.batch_done.connect(self._on_batch_done)
+        self._batch_worker.start()
+
     def _on_module_started(self, name: str):
         row = ModuleRow(name)
         row.set_running()
@@ -1479,11 +2134,125 @@ class MainWindow(QWidget):
         if name in self._mod_rows:
             self._mod_rows[name].set_done(count, elapsed)
 
+    def _on_batch_file_started(self, name: str, current: int, total: int):
+        self.batch_hdr.setText(
+            f"BATCH SCAN  ·  {current}/{total}  ·  {name}")
+        self.scan_btn.setText(f"Scanning {current}/{total}…")
+        # Clear module rows for new file
+        while self.log_layout.count():
+            item = self.log_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self._mod_rows.clear()
+
+    def _on_batch_file_done(self, path: str, findings: list, html_out: str):
+        name   = Path(path).name
+        counts = {}
+        for f in findings: counts[f.severity] = counts.get(f.severity, 0) + 1
+
+        row = QWidget()
+        row.setFixedHeight(40)
+        row.setStyleSheet(
+            "QWidget{background:#0b1628;border-bottom:1px solid #0d1f35;}"
+            "QWidget:hover{background:#101f35;}")
+        lo = QHBoxLayout(row)
+        lo.setContentsMargins(14, 0, 14, 0)
+        lo.setSpacing(8)
+
+        name_lbl = QLabel(name)
+        name_lbl.setStyleSheet("color:#c8d8e8;font-family:Consolas;font-size:12px;background:transparent;")
+        name_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        SEV_COL = {'CRITICAL':'#f03737','HIGH':'#f87325','MEDIUM':'#d4a017','LOW':'#3b8cf8'}
+        for sev, col in SEV_COL.items():
+            n = counts.get(sev, 0)
+            if n:
+                lbl = QLabel(f'{n} {sev[:1]}')
+                lbl.setStyleSheet(
+                    f'color:{col};font-family:Consolas;font-size:10px;'
+                    f'background:rgba({int(col[1:3],16)},{int(col[3:5],16)},{int(col[5:],16)},30);'
+                    f'border:1px solid {col};border-radius:3px;padding:1px 5px;')
+                lo.addWidget(lbl)
+
+        if html_out and Path(html_out).is_file():
+            open_btn = QPushButton("→")
+            open_btn.setFixedSize(26, 26)
+            open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            open_btn.setStyleSheet(
+                "QPushButton{background:transparent;color:#00dcb4;border:none;font-size:14px;}"
+                "QPushButton:hover{color:#c8d8e8;}")
+            _h = html_out
+            open_btn.clicked.connect(
+                lambda _, h=_h: QDesktopServices.openUrl(QUrl.fromLocalFile(h)))
+            lo.insertWidget(1, name_lbl)
+            lo.addWidget(open_btn)
+        else:
+            lo.insertWidget(0, name_lbl)
+
+        self.batch_list_lo.addWidget(row)
+        self.batch_panel.setVisible(True)
+
+    def _on_batch_done(self, results: list):
+        total = sum(len(f) for _, f, _ in results)
+        self.scan_btn.setText(f"BATCH SCAN ({len(self._batch_targets)} file)")
+        self.scan_btn.setEnabled(True)
+        self.batch_hdr.setText(
+            f"BATCH SCAN SELESAI  ·  {len(results)} file  ·  {total} findings")
+        self._batch_report_path = str(_LOG_DIR / 'zwinscan_batch_report.html')
+        if Path(self._batch_report_path).is_file():
+            self.batch_report_btn.setVisible(True)
+
+        # ── Save to history ──
+        counts = {}
+        for _, findings, _ in results:
+            for f in findings:
+                counts[f.severity] = counts.get(f.severity, 0) + 1
+        risk = counts.get('CRITICAL', 0) * 10 + counts.get('HIGH', 0) * 3 + counts.get('MEDIUM', 0)
+        duration = f'{time.time() - self._scan_start_time:.1f}s'
+        folder = str(Path(self._batch_targets[0]).parent) if self._batch_targets else ''
+        _append_history({
+            'name': f'Batch ({len(results)} file)',
+            'path': folder,
+            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'duration': duration,
+            'counts': counts,
+            'report': self._batch_report_path,
+            'is_batch': True,
+            'risk': risk,
+            'trend': None,
+        })
+        self._refresh_compact_history()
+
+    def _open_batch_report(self):
+        if hasattr(self, '_batch_report_path') and Path(self._batch_report_path).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._batch_report_path))
+
     def _on_scan_done(self, findings: list, html_path: str):
         self._html_out = html_path
         self._findings = findings
         self.scan_btn.setEnabled(True)
         self.scan_btn.setText("SCAN ULANG")
+
+        # ── Save to history ──
+        counts = {}
+        for f in findings:
+            counts[f.severity] = counts.get(f.severity, 0) + 1
+        risk = counts.get('CRITICAL', 0) * 10 + counts.get('HIGH', 0) * 3 + counts.get('MEDIUM', 0)
+        duration = f'{time.time() - self._scan_start_time:.1f}s'
+        prev = _load_history()
+        prev_risk = prev[0].get('risk', -1) if prev and prev[0].get('path') == self._target else -1
+        trend = ('up' if risk > prev_risk else 'down' if risk < prev_risk else None) if prev_risk >= 0 else None
+        _append_history({
+            'name': Path(self._target).name,
+            'path': self._target,
+            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'duration': duration,
+            'counts': counts,
+            'report': html_path,
+            'is_batch': False,
+            'risk': risk,
+            'trend': trend,
+        })
+        self._refresh_compact_history()
 
         # Build chat context
         lines = [f'[{f.severity}] {f.category}: {f.title}' for f in findings]
