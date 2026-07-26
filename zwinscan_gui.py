@@ -1576,6 +1576,16 @@ class MainWindow(QWidget):
         self.move((screen.width()-700)//2, (screen.height()-700)//2)
 
     def _build(self):
+        _TAB_ON  = ("QPushButton{background:transparent;color:#00dcb4;border:none;"
+                    "border-bottom:2px solid #00dcb4;font-size:11px;font-family:Consolas;"
+                    "letter-spacing:1px;padding:0 18px;}")
+        _TAB_OFF = ("QPushButton{background:transparent;color:#2a3f58;border:none;"
+                    "border-bottom:2px solid transparent;font-size:11px;font-family:Consolas;"
+                    "letter-spacing:1px;padding:0 18px;}"
+                    "QPushButton:hover{color:#7a9ab8;}")
+        self._TAB_ON  = _TAB_ON
+        self._TAB_OFF = _TAB_OFF
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -1587,15 +1597,43 @@ class MainWindow(QWidget):
         QShortcut(QKeySequence("Ctrl+Up"),   self).activated.connect(lambda: self._adjust_opacity(+0.05))
         QShortcut(QKeySequence("Ctrl+Down"), self).activated.connect(lambda: self._adjust_opacity(-0.05))
 
-        # Scrollable content area
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { background: #050d1a; border: none; }")
+        # ── Tab bar ──────────────────────────────────────────
+        tab_bar = QWidget()
+        tab_bar.setFixedHeight(36)
+        tab_bar.setStyleSheet("QWidget{background:#040b15;border-bottom:1px solid #0d1f35;}")
+        tab_lo = QHBoxLayout(tab_bar)
+        tab_lo.setContentsMargins(20, 0, 20, 0)
+        tab_lo.setSpacing(0)
 
-        content = QWidget()
-        content.setStyleSheet("background: #050d1a;")
-        inner = QVBoxLayout(content)
+        self._tab_scan = QPushButton("SCAN")
+        self._tab_scan.setFixedHeight(36)
+        self._tab_scan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tab_scan.setStyleSheet(_TAB_ON)
+        self._tab_scan.clicked.connect(lambda: self._switch_tab(0))
+        tab_lo.addWidget(self._tab_scan)
+
+        self._tab_hist = QPushButton("RIWAYAT")
+        self._tab_hist.setFixedHeight(36)
+        self._tab_hist.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tab_hist.setStyleSheet(_TAB_OFF)
+        self._tab_hist.clicked.connect(lambda: self._switch_tab(1))
+        tab_lo.addWidget(self._tab_hist)
+        tab_lo.addStretch()
+        root.addWidget(tab_bar)
+
+        # ── Stacked pages ────────────────────────────────────
+        self._pages = QStackedWidget()
+        self._pages.setStyleSheet("background:#050d1a;")
+        root.addWidget(self._pages)
+
+        # ── Page 0: Scan ─────────────────────────────────────
+        scan_scroll = QScrollArea()
+        scan_scroll.setWidgetResizable(True)
+        scan_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scan_scroll.setStyleSheet("QScrollArea{background:#050d1a;border:none;}")
+        scan_content = QWidget()
+        scan_content.setStyleSheet("background:#050d1a;")
+        inner = QVBoxLayout(scan_content)
         inner.setContentsMargins(24, 24, 24, 24)
         inner.setSpacing(16)
 
@@ -1892,46 +1930,65 @@ class MainWindow(QWidget):
         inner.addWidget(self.chat_panel)
         inner.addStretch()
 
-        scroll.setWidget(content)
-        root.addWidget(scroll)
+        scan_scroll.setWidget(scan_content)
+        self._pages.addWidget(scan_scroll)   # index 0
 
-        # ── Fixed history footer ───────────────────────────
-        hist_footer = QWidget()
-        hist_footer.setStyleSheet(
-            "QWidget{background:#040b15;border-top:1px solid #0d1f35;}")
-        hist_footer_lo = QVBoxLayout(hist_footer)
-        hist_footer_lo.setContentsMargins(16, 6, 16, 8)
-        hist_footer_lo.setSpacing(4)
+        # ── Page 1: Riwayat ──────────────────────────────────
+        hist_page = QWidget()
+        hist_page.setStyleSheet("background:#050d1a;")
+        hist_lo = QVBoxLayout(hist_page)
+        hist_lo.setContentsMargins(20, 16, 20, 12)
+        hist_lo.setSpacing(10)
 
-        # Header row
-        hdr_row = QHBoxLayout()
-        hdr_lbl = QLabel("RIWAYAT")
-        hdr_lbl.setStyleSheet(
-            "color:#2a3f58;font-size:9px;font-family:Consolas;letter-spacing:2px;"
-            "background:transparent;border:none;")
-        hdr_row.addWidget(hdr_lbl)
-        hdr_row.addStretch()
-        see_all_btn = QPushButton("Lihat semua ›")
-        see_all_btn.setFixedHeight(18)
-        see_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        see_all_btn.setStyleSheet(
-            "QPushButton{background:transparent;color:#2a3f58;border:none;"
-            "font-size:9px;font-family:Consolas;padding:0;}"
-            "QPushButton:hover{color:#00dcb4;}")
-        see_all_btn.clicked.connect(self._show_history_overlay)
-        hdr_row.addWidget(see_all_btn)
-        hist_footer_lo.addLayout(hdr_row)
+        # Search + clear row
+        h_top = QHBoxLayout()
+        h_top.setSpacing(8)
+        self._hist_search = QLineEdit()
+        self._hist_search.setPlaceholderText("Cari nama file…")
+        self._hist_search.setFixedHeight(30)
+        self._hist_search.setStyleSheet(
+            "QLineEdit{background:#0b1628;border:1px solid #162b47;border-radius:5px;"
+            "color:#c8d8e8;font-family:Consolas;font-size:11px;padding:2px 8px;}"
+            "QLineEdit:focus{border-color:#1e3a5f;}")
+        self._hist_search.textChanged.connect(self._filter_history_tab)
+        h_top.addWidget(self._hist_search)
 
-        # Entry rows container
-        self.history_frame = QWidget()
-        self.history_frame.setStyleSheet("background:transparent;")
-        self.history_lo = QVBoxLayout(self.history_frame)
-        self.history_lo.setContentsMargins(0, 0, 0, 0)
-        self.history_lo.setSpacing(0)
-        hist_footer_lo.addWidget(self.history_frame)
+        h_clear = QPushButton("Hapus semua")
+        h_clear.setFixedHeight(30)
+        h_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        h_clear.setStyleSheet(
+            "QPushButton{background:#0b1628;color:#2a3f58;border:1px solid #162b47;"
+            "border-radius:5px;font-size:10px;padding:0 10px;}"
+            "QPushButton:hover{color:#f03737;border-color:#f03737;}")
+        h_clear.clicked.connect(self._clear_history_tab)
+        h_top.addWidget(h_clear)
+        hist_lo.addLayout(h_top)
 
-        root.addWidget(hist_footer)
-        self._refresh_compact_history()
+        self._hist_count_lbl = QLabel()
+        self._hist_count_lbl.setStyleSheet(
+            "color:#2a3f58;font-family:Consolas;font-size:10px;")
+        hist_lo.addWidget(self._hist_count_lbl)
+
+        # Scrollable list
+        h_scroll = QScrollArea()
+        h_scroll.setWidgetResizable(True)
+        h_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        h_scroll.setStyleSheet(
+            "QScrollArea{border:1px solid #162b47;border-radius:6px;background:#0b1628;}")
+        self._hist_list_widget = QWidget()
+        self._hist_list_widget.setStyleSheet("background:#0b1628;")
+        self._hist_list_lo = QVBoxLayout(self._hist_list_widget)
+        self._hist_list_lo.setContentsMargins(0, 0, 0, 0)
+        self._hist_list_lo.setSpacing(0)
+        h_scroll.setWidget(self._hist_list_widget)
+        hist_lo.addWidget(h_scroll)
+
+        self._pages.addWidget(hist_page)     # index 1
+
+        # Init tab RIWAYAT label with count if history exists
+        n = len(_load_history())
+        if n:
+            self._tab_hist.setText(f'RIWAYAT  {n}')
 
     # ── slots ────────────────────────────────────────────
 
@@ -2032,42 +2089,61 @@ class MainWindow(QWidget):
         else:
             self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
 
-    # ── History helpers ──────────────────────────────────
+    # ── Tab & History helpers ────────────────────────────
+
+    def _switch_tab(self, idx: int):
+        self._pages.setCurrentIndex(idx)
+        self._tab_scan.setStyleSheet(self._TAB_ON  if idx == 0 else self._TAB_OFF)
+        self._tab_hist.setStyleSheet(self._TAB_ON  if idx == 1 else self._TAB_OFF)
+        if idx == 1:
+            self._refresh_history_tab(_load_history())
 
     def _refresh_compact_history(self):
-        while self.history_lo.count():
-            item = self.history_lo.takeAt(0)
+        # After a scan completes: if user is on history tab, refresh it
+        if hasattr(self, '_pages') and self._pages.currentIndex() == 1:
+            self._refresh_history_tab(_load_history())
+
+    def _refresh_history_tab(self, entries: list):
+        while self._hist_list_lo.count():
+            item = self._hist_list_lo.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-        entries = _load_history()[:5]
+        self._hist_count_lbl.setText(f'{len(entries)} scan tersimpan')
         if not entries:
             ph = QLabel("Belum ada riwayat scan.")
             ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            ph.setFixedHeight(36)
-            ph.setStyleSheet("color:#2a3f58;font-family:Consolas;font-size:11px;")
-            self.history_lo.addWidget(ph)
-            return
-        for e in entries:
-            row = HistoryRow(e, compact=True)
-            row.open_report.connect(self._open_report_file)
-            row.rescan.connect(self._do_rescan)
-            self.history_lo.addWidget(row)
+            ph.setFixedHeight(60)
+            ph.setStyleSheet("color:#2a3f58;font-family:Consolas;font-size:12px;")
+            self._hist_list_lo.addWidget(ph)
+        else:
+            for e in entries:
+                row = HistoryRow(e, compact=False)
+                row.open_report.connect(self._open_report_file)
+                row.rescan.connect(self._do_rescan_from_history)
+                self._hist_list_lo.addWidget(row)
+        self._hist_list_lo.addStretch()
+
+    def _filter_history_tab(self, text: str):
+        q = text.lower()
+        all_e = _load_history()
+        filtered = [e for e in all_e if q in e.get('name','').lower()] if q else all_e
+        self._hist_count_lbl.setText(f'{len(filtered)} dari {len(all_e)} scan')
+        self._refresh_history_tab(filtered)
+
+    def _clear_history_tab(self):
+        _save_history([])
+        self._refresh_history_tab([])
 
     def _show_history_overlay(self):
-        if self._history_overlay:
-            self._history_overlay.deleteLater()
-        self._history_overlay = HistoryOverlay(self)
-        self._history_overlay._entries = _load_history()
-        self._history_overlay._render(self._history_overlay._entries)
-        # Cover full window minus titlebar; overlay is inside the window
-        self._history_overlay.setGeometry(0, 48, self.width(), self.height() - 48)
-        self._history_overlay.do_open.connect(self._open_report_file)
-        self._history_overlay.do_rescan.connect(self._do_rescan)
-        self._history_overlay.show()
+        self._switch_tab(1)
 
     def _open_report_file(self, path: str):
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _do_rescan(self, path: str):
+        self._on_file(path)
+
+    def _do_rescan_from_history(self, path: str):
+        self._switch_tab(0)
         self._on_file(path)
 
     # ── Scan starters ────────────────────────────────────
@@ -2231,6 +2307,7 @@ class MainWindow(QWidget):
             'trend': None,
         })
         self._refresh_compact_history()
+        self._tab_hist.setText(f'RIWAYAT  {len(_load_history())}')
 
     def _open_batch_report(self):
         if hasattr(self, '_batch_report_path') and Path(self._batch_report_path).is_file():
@@ -2263,6 +2340,7 @@ class MainWindow(QWidget):
             'trend': trend,
         })
         self._refresh_compact_history()
+        self._tab_hist.setText(f'RIWAYAT  {len(_load_history())}')
 
         # Build chat context
         lines = [f'[{f.severity}] {f.category}: {f.title}' for f in findings]
