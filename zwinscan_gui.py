@@ -313,6 +313,110 @@ class ZWinScanner:
         except Exception as e:
             log.debug(f'check_imports error: {e}')
 
+    def check_exploitability(self):
+        """Nilai posture mitigasi memori → rating exploitability (untuk pengujian berizin).
+
+        Bukan eksploitasi aktif: hanya menilai seberapa mudah SEBUAH bug memory-
+        corruption (bila ada) dapat dikembangkan menjadi eksekusi kode, berdasarkan
+        mitigasi yang aktif/nonaktif pada binary — mirip winchecksec/BinScope.
+        """
+        if not HAS_PEFILE:
+            self._add('INFO', 'Exploitability', 'pefile tidak terinstall — assessment dilewati')
+            return
+        try:
+            pe = pefile.PE(str(self.target), fast_load=False)
+            dc   = pe.OPTIONAL_HEADER.DllCharacteristics
+            mach = pe.FILE_HEADER.Machine
+            aslr = bool(dc & 0x0040)   # DYNAMIC_BASE
+            hi   = bool(dc & 0x0020)   # HIGH_ENTROPY_VA
+            dep  = bool(dc & 0x0100)   # NX_COMPAT
+            cfg  = bool(dc & 0x4000)   # GUARD_CF
+            noseh= bool(dc & 0x0400)   # NO_SEH
+            is64 = mach == 0x8664
+            arch = 'x64' if is64 else ('x86' if mach == 0x14c else f'0x{mach:x}')
+
+            # SafeSEH (khusus 32-bit): ada SEHandlerTable di Load Config?
+            safeseh = None
+            if not is64:
+                try:
+                    pe.parse_data_directories(
+                        directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG']])
+                    lc = getattr(pe, 'DIRECTORY_ENTRY_LOAD_CONFIG', None)
+                    if lc is not None:
+                        safeseh = getattr(lc.struct, 'SEHandlerCount', 0) > 0
+                except Exception:
+                    safeseh = None
+
+            # cek API injeksi/eksekusi (primitif pasca-kompromi)
+            inj = set()
+            if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                INJECTION = {'CreateRemoteThread','VirtualAllocEx','WriteProcessMemory',
+                             'NtWriteVirtualMemory','RtlCreateUserThread','QueueUserAPC',
+                             'VirtualProtect','VirtualProtectEx'}
+                for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                    for imp in entry.imports:
+                        if imp.name:
+                            n = imp.name.decode(errors='ignore')
+                            if n in INJECTION:
+                                inj.add(n)
+            pe.close()
+
+            # skor exploitability (asumsi ADA bug memory-corruption)
+            score, missing, paths = 0, [], []
+            if not aslr:
+                score += 3; missing.append('ASLR')
+                paths.append('alamat modul dapat diprediksi → hardcode gadget/alamat tanpa info-leak')
+            elif not hi and is64:
+                paths.append('ASLR aktif tapi tanpa High-Entropy VA → ruang acak lebih sempit di x64')
+            if not dep:
+                score += 3; missing.append('DEP/NX')
+                paths.append('memori data dapat dieksekusi → shellcode langsung tanpa ROP')
+            if not cfg:
+                score += 2; missing.append('CFG')
+                paths.append('indirect call/jump tidak dijaga → pembajakan alur via ROP/JOP')
+            if not is64 and safeseh is False and not noseh:
+                score += 1; missing.append('SafeSEH')
+                paths.append('SEH tidak dilindungi → klasik SEH-overwrite (x86)')
+
+            if score >= 6:
+                sev, rate = 'CRITICAL', 'TINGGI'
+            elif score >= 4:
+                sev, rate = 'HIGH', 'TINGGI'
+            elif score >= 2:
+                sev, rate = 'MEDIUM', 'SEDANG'
+            else:
+                sev, rate = 'INFO', 'RENDAH'
+
+            active = [m for m, on in [('ASLR', aslr), ('DEP/NX', dep), ('CFG', cfg)] if on]
+            detail = [
+                f'Arsitektur : {arch}',
+                f'Mitigasi aktif   : {", ".join(active) or "(tidak ada)"}',
+                f'Mitigasi hilang  : {", ".join(missing) or "(tidak ada)"}',
+                f'Skor exploitability: {score}/9 → {rate}',
+            ]
+            if paths:
+                detail.append('')
+                detail.append('Jalur eksploitasi hipotetis (bila ditemukan bug memory-corruption):')
+                detail += [f'  • {p}' for p in paths]
+            if inj:
+                detail.append('')
+                detail.append('Primitif pasca-kompromi (API di import table): '
+                               + ', '.join(sorted(inj)))
+            if score == 0:
+                detail.append('')
+                detail.append('Binary ter-hardening penuh: eksploitasi memory-corruption '
+                              'akan menuntut info-leak + bypass CFG (kompleksitas tinggi).')
+            detail.append('')
+            detail.append('Catatan: penilaian statis untuk pengujian keamanan berizin — '
+                          'tidak mengeksekusi/menyerang target.')
+
+            self._add(sev, 'Exploitability',
+                      f'Exploitability memory-corruption: {rate} ({score}/9)',
+                      '\n'.join(detail))
+        except Exception as e:
+            log.debug(f'check_exploitability error: {e}')
+            self._add('INFO', 'Exploitability', f'Gagal menilai exploitability: {e}')
+
     def check_section_entropy(self):
         """Hitung Shannon entropy tiap PE section — entropy tinggi = packing/obfuscation."""
         if not HAS_PEFILE:
@@ -925,6 +1029,7 @@ class ScanWorker(QThread):
             modules = [
                 ('PE Security Flags',  scanner.check_pe_flags),
                 ('Import Table',       scanner.check_imports),
+                ('Exploitability',     scanner.check_exploitability),
                 ('Section Entropy',    scanner.check_section_entropy),
                 ('Compile Timestamp',  scanner.check_compile_timestamp),
                 ('Digital Signature',  scanner.check_signature),
@@ -1017,6 +1122,7 @@ class BatchScanWorker(QThread):
         MODULES = [
             ('PE Security Flags', 'check_pe_flags'),
             ('Import Table',      'check_imports'),
+            ('Exploitability',    'check_exploitability'),
             ('Section Entropy',   'check_section_entropy'),
             ('Compile Timestamp', 'check_compile_timestamp'),
             ('Digital Signature', 'check_signature'),
