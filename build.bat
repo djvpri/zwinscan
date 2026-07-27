@@ -5,7 +5,7 @@ echo ========================================
 echo.
 
 echo Memastikan dependensi terinstall...
-py -m pip install pyinstaller pefile colorama google-genai --quiet
+py -m pip install pyinstaller pefile colorama google-genai PyQt6 --quiet
 
 if exist "dist\ZWinScan.exe" del /f "dist\ZWinScan.exe"
 if exist "build" rmdir /s /q "build"
@@ -13,7 +13,7 @@ if exist "build" rmdir /s /q "build"
 echo.
 echo Membangun ZWinScan.exe...
 echo.
-py -m PyInstaller zwinscan.spec --clean
+py -m PyInstaller zwinscan_gui.spec --clean
 
 echo.
 if exist "dist\ZWinScan.exe" (
