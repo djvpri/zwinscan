@@ -1043,11 +1043,22 @@ def format_ai_summary(result: dict, target: str = '', findings: list = None,
                       fmt: str = 'md') -> str:
     """Ubah hasil executive summary AI menjadi teks (markdown / plain / html)."""
     findings = findings or []
-    now     = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    name    = Path(target).name if target else '-'
-    try:
-        size = f'{Path(target).stat().st_size/1_048_576:.1f} MB' if target else '-'
-    except OSError:
+    now  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    p    = Path(target) if target else None
+    # Jika target adalah file → tampilkan nama file + ukuran
+    # Jika target adalah folder / label batch → tampilkan apa adanya
+    if p and p.is_file():
+        name = p.name
+        try:
+            size = f'{p.stat().st_size/1_048_576:.1f} MB'
+        except OSError:
+            size = '-'
+    elif p and p.is_dir():
+        name = f'Batch — {p.name}'
+        size = '-'
+    else:
+        # label teks langsung (mis. "Batch (5 file) — Downloads")
+        name = target or '-'
         size = '-'
 
     score       = result.get('risk_score', 0)
@@ -2097,6 +2108,7 @@ class MainWindow(QWidget):
         self._chat_context  = ''
         self._scan_start_time = 0.0
         self._history_overlay = None
+        self._scan_label      = ''   # display name untuk export AI summary
         cfg = _load_config()
         self._api_key = cfg.get('gemini_api_key', '')
         self._vt_api_key = cfg.get('vt_api_key', '')
@@ -2889,6 +2901,10 @@ class MainWindow(QWidget):
 
         # ── AI panel & chat untuk batch ──
         all_findings = [f for _, findings, _ in results for f in findings]
+        # Set _findings, _target, _scan_label agar export AI summary & chat bekerja
+        self._findings   = all_findings
+        self._target     = folder
+        self._scan_label = f'Batch ({len(results)} file) — {Path(folder).name if folder else "?"}'
         lines = [f'[{f.severity}] {f.category}: {f.title}' for f in all_findings]
         self._chat_context = (
             f'Batch scan: {len(results)} file\n'
@@ -2905,8 +2921,9 @@ class MainWindow(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self._batch_report_path))
 
     def _on_scan_done(self, findings: list, html_path: str):
-        self._html_out = html_path
-        self._findings = findings
+        self._html_out   = html_path
+        self._findings   = findings
+        self._scan_label = self._target   # path lengkap → name + size diekstrak di format_ai_summary
         self.scan_btn.setEnabled(True)
         self.scan_btn.setText("SCAN ULANG")
 
@@ -2995,7 +3012,8 @@ class MainWindow(QWidget):
                                     "Belum ada rangkuman AI untuk diekspor.")
             return
 
-        base = Path(self._target).stem if self._target else 'zwinscan'
+        label = self._scan_label or self._target
+        base  = re.sub(r'[^\w\-]', '_', Path(label).stem or 'batch')[:40]
         default = str(_LOG_DIR / f'{base}_rangkuman_ai.md')
         path, sel = QFileDialog.getSaveFileName(
             self, "Ekspor Rangkuman AI", default,
@@ -3005,12 +3023,12 @@ class MainWindow(QWidget):
 
         ext = Path(path).suffix.lower()
         fmt = {'.md': 'md', '.txt': 'txt', '.html': 'html', '.htm': 'html'}.get(ext)
-        if fmt is None:  # tanpa ekstensi → ikuti filter yang dipilih
+        if fmt is None:
             fmt = 'txt' if 'Teks' in sel else ('html' if 'HTML' in sel else 'md')
             path += {'md': '.md', 'txt': '.txt', 'html': '.html'}[fmt]
 
         try:
-            content = format_ai_summary(self._ai_summary, self._target,
+            content = format_ai_summary(self._ai_summary, label,
                                         self._findings, fmt)
             Path(path).write_text(content, encoding='utf-8')
         except OSError as e:
