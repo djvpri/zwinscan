@@ -119,10 +119,13 @@ SEV_ORDER = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3, 'INFO': 4}
 
 # Urutan modul scan (dipakai GUI worker & CLI) — method diresolve via getattr.
 SCAN_MODULES = [
-    ('PE Security Flags', 'check_pe_flags'),
-    ('Import Table',      'check_imports'),
-    ('Exploitability',    'check_exploitability'),
-    ('VirusTotal',        'check_virustotal'),
+    ('PE Security Flags',    'check_pe_flags'),
+    ('Import Table',         'check_imports'),
+    ('Exploitability',       'check_exploitability'),
+    ('Anti-Debug',           'check_anti_debug'),
+    ('ROP Gadgets',          'check_rop_gadgets'),
+    ('Dangerous Functions',  'check_dangerous_functions'),
+    ('VirusTotal',           'check_virustotal'),
     ('Section Entropy',   'check_section_entropy'),
     ('Compile Timestamp', 'check_compile_timestamp'),
     ('Digital Signature', 'check_signature'),
@@ -329,6 +332,257 @@ class ZWinScanner:
             pe.close()
         except Exception as e:
             log.debug(f'check_imports error: {e}')
+
+    def check_anti_debug(self):
+        """Deteksi teknik anti-analisis: anti-debug, anti-VM, timing, thread hiding."""
+        if not HAS_PEFILE:
+            self._add('INFO', 'Anti-Debug', 'pefile tidak terinstall — dilewati'); return
+        try:
+            pe = pefile.PE(str(self.target), fast_load=False)
+            imports = set()
+            if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                    for imp in entry.imports:
+                        if imp.name:
+                            imports.add(imp.name.decode(errors='ignore'))
+
+            # ── Anti-debugger APIs ──
+            ANTI_DBG = {
+                'IsDebuggerPresent'            : ('HIGH',   'Cek langsung apakah dijalankan di bawah debugger'),
+                'CheckRemoteDebuggerPresent'   : ('HIGH',   'Cek debugger remote secara eksplisit'),
+                'NtQueryInformationProcess'    : ('MEDIUM', 'Sering digunakan untuk deteksi debugger via ProcessDebugPort'),
+                'NtSetInformationThread'       : ('HIGH',   'Dapat menyembunyikan thread dari debugger (ThreadHideFromDebugger)'),
+                'OutputDebugStringA'           : ('MEDIUM', 'Teknik anti-debug via GetLastError setelah OutputDebugString'),
+                'OutputDebugStringW'           : ('MEDIUM', 'Teknik anti-debug via GetLastError setelah OutputDebugString'),
+                'DebugBreak'                   : ('LOW',    'Breakpoint eksplisit — mungkin anti-debug atau debug helper'),
+                'FindWindowA'                  : ('LOW',    'Sering digunakan cari jendela debugger (OllyDbg, x64dbg, dll.)'),
+                'FindWindowW'                  : ('LOW',    'Sering digunakan cari jendela debugger (OllyDbg, x64dbg, dll.)'),
+                'BlockInput'                   : ('MEDIUM', 'Blokir input keyboard/mouse — teknik anti-analisis interaktif'),
+            }
+            # ── Timing attack APIs ──
+            TIMING = {
+                'GetTickCount'             : ('LOW',    'Timing check — deteksi slowdown akibat debugger/emulator'),
+                'GetTickCount64'           : ('LOW',    'Timing check 64-bit'),
+                'QueryPerformanceCounter'  : ('LOW',    'High-res timing — deteksi overhead instrumentasi'),
+                'timeGetTime'              : ('LOW',    'Timing check via winmm'),
+                'NtQuerySystemTime'        : ('LOW',    'Kernel-level timing check'),
+            }
+            # ── VM/Sandbox detection APIs ──
+            VM_API = {
+                'GetSystemFirmwareTable'   : ('MEDIUM', 'Baca firmware table — deteksi VM via SMBIOS strings'),
+                'EnumSystemFirmwareTables' : ('MEDIUM', 'Enumerasi firmware tables untuk fingerprint hypervisor'),
+                'cpuid'                    : ('MEDIUM', 'Instruksi CPUID — deteksi hypervisor bit (bit 31 ECX)'),
+            }
+
+            hits_dbg, hits_timing, hits_vm = [], [], []
+            for api, (sev, reason) in ANTI_DBG.items():
+                if api in imports:
+                    hits_dbg.append((api, sev, reason))
+            for api, (sev, reason) in TIMING.items():
+                if api in imports:
+                    hits_timing.append((api, sev, reason))
+            for api, (sev, reason) in VM_API.items():
+                if api in imports:
+                    hits_vm.append((api, sev, reason))
+
+            # ── VM string signatures dalam raw bytes ──
+            vm_strings = []
+            try:
+                raw = Path(self.target).read_bytes()
+                VM_SIGS = [b'VMware', b'VirtualBox', b'VBOX', b'QEMU',
+                           b'Hyper-V', b'VIRTUAL', b'vboxguest', b'vmtoolsd']
+                for sig in VM_SIGS:
+                    if sig.lower() in raw.lower():
+                        vm_strings.append(sig.decode())
+            except Exception:
+                pass
+
+            pe.close()
+
+            total = len(hits_dbg) + len(hits_timing) + len(hits_vm) + len(vm_strings)
+            if total == 0:
+                self._add('INFO', 'Anti-Debug', 'Tidak ditemukan teknik anti-analisis'); return
+
+            # Tentukan severity tertinggi
+            all_sevs = [s for _, s, _ in hits_dbg + hits_timing + hits_vm]
+            top_sev = ('HIGH' if 'HIGH' in all_sevs else
+                       'MEDIUM' if 'MEDIUM' in all_sevs else 'LOW')
+
+            lines = []
+            if hits_dbg:
+                lines.append(f'Anti-debugger APIs ({len(hits_dbg)}):')
+                lines += [f'  [{s}] {a} — {r}' for a, s, r in hits_dbg]
+            if hits_timing:
+                lines.append(f'Timing attack APIs ({len(hits_timing)}):')
+                lines += [f'  [{s}] {a} — {r}' for a, s, r in hits_timing]
+            if hits_vm:
+                lines.append(f'VM-detection APIs ({len(hits_vm)}):')
+                lines += [f'  [{s}] {a} — {r}' for a, s, r in hits_vm]
+            if vm_strings:
+                lines.append(f'VM signature strings: {", ".join(vm_strings)}')
+            lines.append('')
+            lines.append('Catatan: kehadiran API ini tidak membuktikan niat jahat —')
+            lines.append('proteksi software komersial juga menggunakannya.')
+
+            self._add(top_sev, 'Anti-Debug',
+                      f'Ditemukan {total} indikator anti-analisis',
+                      '\n'.join(lines))
+        except Exception as e:
+            log.debug(f'check_anti_debug error: {e}')
+
+    def check_rop_gadgets(self):
+        """Hitung ROP gadget di executable sections — nilai kemudahan ROP chain construction."""
+        if not HAS_PEFILE:
+            self._add('INFO', 'ROP Gadgets', 'pefile tidak terinstall — dilewati'); return
+        try:
+            pe = pefile.PE(str(self.target), fast_load=False)
+            total_gadgets = 0
+            total_exec_bytes = 0
+            useful = []   # gadget menarik
+
+            for section in pe.sections:
+                # Hanya section executable
+                if not (section.Characteristics & 0x20000000):
+                    continue
+                data = section.get_data()
+                total_exec_bytes += len(data)
+
+                # Hitung ret variants: C3 (ret), C2 xx xx (ret n), CB (retf)
+                i = 0
+                while i < len(data):
+                    b = data[i]
+                    if b == 0xC3:                          # ret
+                        total_gadgets += 1
+                        # cek 1-2 byte sebelumnya untuk gadget berguna
+                        if i >= 2:
+                            seq = data[i-2:i+1]
+                            # pop reg ; ret
+                            if 0x58 <= data[i-1] <= 0x5F:
+                                useful.append(f'pop reg ; ret  @ +0x{i-1:x}')
+                            # xchg eax,esp ; ret — stack pivot
+                            if data[i-1] == 0x94:
+                                useful.append(f'xchg eax,esp ; ret  @ +0x{i-1:x} ⚠ pivot')
+                            # jmp esp / call esp
+                            if i >= 2 and data[i-2] == 0xFF and data[i-1] in (0xE4, 0xD4):
+                                useful.append(f'jmp/call esp ; ret  @ +0x{i-2:x} ⚠ shellcode jump')
+                    elif b == 0xC2 and i + 2 < len(data):  # ret n
+                        total_gadgets += 1
+                    i += 1
+
+            pe.close()
+
+            if total_exec_bytes == 0:
+                self._add('INFO', 'ROP Gadgets', 'Tidak ada section executable'); return
+
+            density = total_gadgets / (total_exec_bytes / 1024)  # gadget per KB
+
+            if density > 15 or total_gadgets > 5000:
+                sev, label = 'HIGH', 'TINGGI'
+            elif density > 5 or total_gadgets > 1000:
+                sev, label = 'MEDIUM', 'SEDANG'
+            elif total_gadgets > 0:
+                sev, label = 'LOW', 'RENDAH'
+            else:
+                self._add('INFO', 'ROP Gadgets', 'Tidak ada gadget ROP ditemukan'); return
+
+            lines = [
+                f'Total ROP gadgets   : {total_gadgets}',
+                f'Kode executable     : {total_exec_bytes/1024:.1f} KB',
+                f'Densitas gadget     : {density:.1f} gadget/KB → {label}',
+                '',
+                'Interpretasi:',
+                '  Semakin tinggi densitas, semakin mudah menyusun ROP chain',
+                '  jika ditemukan bug memory-corruption pada binary ini.',
+            ]
+            if useful:
+                lines.append('')
+                lines.append(f'Gadget berguna ({min(len(useful),10)} dari {len(useful)}):')
+                lines += [f'  • {g}' for g in useful[:10]]
+            lines.append('')
+            lines.append('Catatan: penilaian statis untuk pengujian keamanan berizin.')
+
+            self._add(sev, 'ROP Gadgets',
+                      f'{total_gadgets} gadget ROP ({density:.1f}/KB) — kemudahan ROP: {label}',
+                      '\n'.join(lines))
+        except Exception as e:
+            log.debug(f'check_rop_gadgets error: {e}')
+
+    def check_dangerous_functions(self):
+        """Deteksi fungsi C berbahaya di import table — potensi buffer overflow & format string."""
+        if not HAS_PEFILE:
+            self._add('INFO', 'Dangerous Functions', 'pefile tidak terinstall — dilewati'); return
+        try:
+            pe = pefile.PE(str(self.target), fast_load=False)
+            imports = {}
+            if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                    dll = entry.dll.decode(errors='ignore').lower()
+                    for imp in entry.imports:
+                        if imp.name:
+                            imports[imp.name.decode(errors='ignore')] = dll
+            pe.close()
+
+            DANGEROUS = {
+                # Buffer overflow
+                'strcpy'   : ('HIGH',   'Buffer overflow — tidak ada bounds check (gunakan strcpy_s)'),
+                'strcpyA'  : ('HIGH',   'Buffer overflow — tidak ada bounds check'),
+                'wcscpy'   : ('HIGH',   'Buffer overflow wide-char'),
+                'strcat'   : ('HIGH',   'Buffer overflow — konkatenasi tanpa batas (gunakan strcat_s)'),
+                'wcscat'   : ('HIGH',   'Buffer overflow wide-char'),
+                'gets'     : ('CRITICAL','Buffer overflow — tidak bisa dibatasi (deprecated C99)'),
+                'gets_s'   : ('LOW',    'Versi aman gets — oke jika dipakai dengan benar'),
+                'sprintf'  : ('HIGH',   'Buffer overflow — output tak terbatas (gunakan sprintf_s/snprintf)'),
+                'swprintf' : ('HIGH',   'Buffer overflow wide-char'),
+                'vsprintf' : ('HIGH',   'Buffer overflow — format string tidak dibatasi'),
+                'scanf'    : ('MEDIUM', 'Potensi overflow pada %s tanpa lebar field'),
+                'sscanf'   : ('MEDIUM', 'Potensi overflow pada %s tanpa lebar field'),
+                'memcpy'   : ('LOW',    'Aman jika ukuran benar, sering salah — audit manual'),
+                'memmove'  : ('LOW',    'Aman jika ukuran benar — audit manual'),
+                # Format string
+                'printf'   : ('MEDIUM', 'Format string vuln jika format string dari input user'),
+                'wprintf'  : ('MEDIUM', 'Format string wide-char'),
+                'fprintf'  : ('MEDIUM', 'Format string ke file'),
+                'syslog'   : ('MEDIUM', 'Format string ke syslog'),
+                # Integer / unsafe
+                'atoi'     : ('LOW',    'Tidak cek overflow integer'),
+                'atol'     : ('LOW',    'Tidak cek overflow integer'),
+                'strtok'   : ('LOW',    'Tidak thread-safe — race condition pada multi-thread'),
+                'rand'     : ('LOW',    'PRNG lemah — jangan pakai untuk kriptografi/token'),
+                # Exec
+                'system'   : ('HIGH',   'Eksekusi perintah shell — injection jika input user masuk'),
+                'WinExec'  : ('HIGH',   'Eksekusi proses — injection jika path dari input'),
+                'ShellExecuteA': ('MEDIUM','Shell execute — injection jika args dari input'),
+                'ShellExecuteW': ('MEDIUM','Shell execute — injection jika args dari input'),
+            }
+
+            found = [(fn, DANGEROUS[fn][0], DANGEROUS[fn][1])
+                     for fn in imports if fn in DANGEROUS]
+            if not found:
+                self._add('INFO', 'Dangerous Functions',
+                          'Tidak ditemukan fungsi C berbahaya di import table'); return
+
+            found.sort(key=lambda x: {'CRITICAL':0,'HIGH':1,'MEDIUM':2,'LOW':3}.get(x[1],4))
+            top_sev = found[0][1]
+
+            by_sev = {}
+            for fn, sev, reason in found:
+                by_sev.setdefault(sev, []).append((fn, reason))
+
+            lines = [f'Ditemukan {len(found)} fungsi berpotensi berbahaya:', '']
+            for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+                if sev in by_sev:
+                    lines.append(f'[{sev}]')
+                    for fn, reason in by_sev[sev]:
+                        lines.append(f'  {fn} — {reason}')
+            lines += ['', 'Catatan: kehadiran fungsi ini tidak otomatis berarti vulnerable —',
+                      'bergantung pada cara penggunaannya dalam kode.']
+
+            self._add(top_sev, 'Dangerous Functions',
+                      f'{len(found)} fungsi berbahaya: {", ".join(f for f,_,_ in found[:5])}'
+                      + (f' (+{len(found)-5} lagi)' if len(found) > 5 else ''),
+                      '\n'.join(lines))
+        except Exception as e:
+            log.debug(f'check_dangerous_functions error: {e}')
 
     def check_exploitability(self):
         """Nilai posture mitigasi memori → rating exploitability (untuk pengujian berizin).
