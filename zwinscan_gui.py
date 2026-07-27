@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ZWinScan GUI — Windows Application Security Analyzer"""
 
-import sys, os, time, datetime, json, re, base64, logging, traceback, subprocess
+import sys, os, time, datetime, json, re, base64, hashlib, logging, traceback, subprocess
 from pathlib import Path
 from typing import List
 from dataclasses import dataclass
@@ -141,8 +141,9 @@ class ZWinScanner:
         ('Internal IP address',  r'(?<!\d)(192\.168\.|10\.\d+\.|172\.(1[6-9]|2\d|3[01])\.)\d+\.\d+(?!\d)', 'LOW'),
     ]
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, vt_api_key: str = ''):
         self.target   = Path(path)
+        self.vt_api_key = vt_api_key
         self.findings: List[Finding] = []
 
     def _add(self, sev, cat, title, detail=''):
@@ -416,6 +417,89 @@ class ZWinScanner:
         except Exception as e:
             log.debug(f'check_exploitability error: {e}')
             self._add('INFO', 'Exploitability', f'Gagal menilai exploitability: {e}')
+
+    def check_virustotal(self):
+        """Lookup SHA-256 file ke VirusTotal (v3) — reputasi berdasarkan hash.
+
+        Hanya lookup by hash (tidak mengunggah file), jadi tidak membocorkan
+        binary. Butuh API key VirusTotal; tanpa key modul dilewati.
+        """
+        try:
+            data = self.target.read_bytes()
+        except OSError as e:
+            self._add('INFO', 'VirusTotal', f'Gagal membaca file: {e}')
+            return
+        sha256 = hashlib.sha256(data).hexdigest()
+
+        if not self.vt_api_key:
+            self._add('INFO', 'VirusTotal',
+                      'Dilewati — API key VirusTotal belum diisi',
+                      f'SHA-256: {sha256}\nIsi VT API key di Pengaturan untuk cek reputasi hash.')
+            return
+
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f'https://www.virustotal.com/api/v3/files/{sha256}',
+            headers={'x-apikey': self.vt_api_key, 'Accept': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode('utf-8', 'ignore'))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                self._add('INFO', 'VirusTotal',
+                          'Hash tidak dikenal di VirusTotal',
+                          f'SHA-256: {sha256}\nFile belum pernah dianalisis VT '
+                          '(bukan berarti aman — bisa jadi sampel baru/langka).')
+            elif e.code == 401:
+                self._add('MEDIUM', 'VirusTotal', 'API key VirusTotal ditolak (401)',
+                          'Periksa kembali VT API key di Pengaturan.')
+            elif e.code == 429:
+                self._add('INFO', 'VirusTotal', 'Rate limit VirusTotal (429)',
+                          'Kuota API terlampaui. Coba lagi nanti.')
+            else:
+                self._add('INFO', 'VirusTotal', f'VirusTotal error HTTP {e.code}')
+            return
+        except Exception as e:
+            self._add('INFO', 'VirusTotal', f'Gagal menghubungi VirusTotal: {e}')
+            return
+
+        attr    = payload.get('data', {}).get('attributes', {})
+        stats   = attr.get('last_analysis_stats', {})
+        mal     = stats.get('malicious', 0)
+        susp    = stats.get('suspicious', 0)
+        harmless= stats.get('harmless', 0)
+        undet   = stats.get('undetected', 0)
+        total   = mal + susp + harmless + undet + stats.get('timeout', 0)
+        rep     = attr.get('reputation', 0)
+        names   = attr.get('popular_threat_classification', {}).get('suggested_threat_label', '')
+        vt_link = f'https://www.virustotal.com/gui/file/{sha256}'
+
+        if mal >= 5:
+            sev = 'CRITICAL'
+        elif mal >= 1:
+            sev = 'HIGH'
+        elif susp >= 1:
+            sev = 'MEDIUM'
+        else:
+            sev = 'INFO'
+
+        detail = [
+            f'Deteksi: {mal} malicious, {susp} suspicious dari {total} engine',
+            f'Bersih : {harmless} harmless, {undet} undetected',
+            f'Reputasi komunitas: {rep}',
+        ]
+        if names:
+            detail.append(f'Label ancaman: {names}')
+        detail.append(f'SHA-256: {sha256}')
+        detail.append(f'Laporan: {vt_link}')
+
+        if mal >= 1:
+            title = f'Terdeteksi jahat oleh {mal}/{total} engine VirusTotal'
+        elif susp >= 1:
+            title = f'{susp}/{total} engine menandai mencurigakan'
+        else:
+            title = f'Bersih di VirusTotal (0/{total} deteksi)'
+        self._add(sev, 'VirusTotal', title, '\n'.join(detail))
 
     def check_section_entropy(self):
         """Hitung Shannon entropy tiap PE section — entropy tinggi = packing/obfuscation."""
@@ -1017,19 +1101,21 @@ class ScanWorker(QThread):
     ai_strings_done = pyqtSignal(dict)   # string classifier result
     ai_error        = pyqtSignal(str)
 
-    def __init__(self, target: str, api_key: str = ''):
+    def __init__(self, target: str, api_key: str = '', vt_api_key: str = ''):
         super().__init__()
         self.target  = target
         self.api_key = api_key
+        self.vt_api_key = vt_api_key
 
     def run(self):
         log.info(f'Scan started: {self.target}')
         try:
-            scanner = ZWinScanner(self.target)
+            scanner = ZWinScanner(self.target, self.vt_api_key)
             modules = [
                 ('PE Security Flags',  scanner.check_pe_flags),
                 ('Import Table',       scanner.check_imports),
                 ('Exploitability',     scanner.check_exploitability),
+                ('VirusTotal',         scanner.check_virustotal),
                 ('Section Entropy',    scanner.check_section_entropy),
                 ('Compile Timestamp',  scanner.check_compile_timestamp),
                 ('Digital Signature',  scanner.check_signature),
@@ -1111,10 +1197,11 @@ class BatchScanWorker(QThread):
     ai_summary_done     = pyqtSignal(dict)
     ai_error            = pyqtSignal(str)
 
-    def __init__(self, targets: list, api_key: str = ''):
+    def __init__(self, targets: list, api_key: str = '', vt_api_key: str = ''):
         super().__init__()
         self.targets = targets
         self.api_key = api_key
+        self.vt_api_key = vt_api_key
 
     def run(self):
         log.info(f'Batch scan: {len(self.targets)} files')
@@ -1123,6 +1210,7 @@ class BatchScanWorker(QThread):
             ('PE Security Flags', 'check_pe_flags'),
             ('Import Table',      'check_imports'),
             ('Exploitability',    'check_exploitability'),
+            ('VirusTotal',        'check_virustotal'),
             ('Section Entropy',   'check_section_entropy'),
             ('Compile Timestamp', 'check_compile_timestamp'),
             ('Digital Signature', 'check_signature'),
@@ -1137,7 +1225,7 @@ class BatchScanWorker(QThread):
             self.file_started.emit(name, idx + 1, len(self.targets))
             log.info(f'Batch [{idx+1}/{len(self.targets)}]: {target}')
             try:
-                scanner = ZWinScanner(target)
+                scanner = ZWinScanner(target, self.vt_api_key)
                 t0 = time.time()
                 prev = 0
                 for mod_name, method in MODULES:
@@ -1767,6 +1855,7 @@ class MainWindow(QWidget):
         self._history_overlay = None
         cfg = _load_config()
         self._api_key = cfg.get('gemini_api_key', '')
+        self._vt_api_key = cfg.get('vt_api_key', '')
         self._setwindow()
         self._build()
 
@@ -1906,6 +1995,25 @@ class MainWindow(QWidget):
         key_row.addWidget(self._key_status)
         inner.addLayout(key_row)
         self._update_key_style()
+
+        # VirusTotal API Key row
+        vt_row = QHBoxLayout()
+        vt_row.setSpacing(6)
+        vt_lbl = QLabel("🛡")
+        vt_lbl.setFixedWidth(20)
+        vt_lbl.setStyleSheet("font-size:14px; background:transparent;")
+        self.vt_edit = QLineEdit(self._vt_api_key)
+        self.vt_edit.setPlaceholderText("VirusTotal API Key (opsional — cek reputasi hash)")
+        self.vt_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.vt_edit.textChanged.connect(self._on_vt_key_changed)
+        self._vt_status = QLabel("✓ Tersimpan" if self._vt_api_key else "")
+        self._vt_status.setFixedWidth(80)
+        self._vt_status.setStyleSheet(
+            "color:#00dcb4;font-family:Consolas;font-size:10px;background:transparent;")
+        vt_row.addWidget(vt_lbl)
+        vt_row.addWidget(self.vt_edit)
+        vt_row.addWidget(self._vt_status)
+        inner.addLayout(vt_row)
 
         # Scan button
         self.scan_btn = QPushButton("SCAN")
@@ -2284,6 +2392,13 @@ class MainWindow(QWidget):
         _save_config(cfg)
         self._update_key_style()
 
+    def _on_vt_key_changed(self, text: str):
+        self._vt_api_key = text.strip()
+        cfg = _load_config()
+        cfg['vt_api_key'] = self._vt_api_key
+        _save_config(cfg)
+        self._vt_status.setText("✓ Tersimpan" if self._vt_api_key else "")
+
     def _update_key_style(self):
         if self._api_key:
             self.key_edit.setStyleSheet("""
@@ -2390,7 +2505,7 @@ class MainWindow(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-        self._worker = ScanWorker(self._target, self._api_key)
+        self._worker = ScanWorker(self._target, self._api_key, self._vt_api_key)
         self._worker.module_started.connect(self._on_module_started)
         self._worker.module_done.connect(self._on_module_done)
         self._worker.scan_done.connect(self._on_scan_done)
@@ -2419,7 +2534,7 @@ class MainWindow(QWidget):
 
         self._batch_report_path = ''
 
-        self._batch_worker = BatchScanWorker(self._batch_targets, self._api_key)
+        self._batch_worker = BatchScanWorker(self._batch_targets, self._api_key, self._vt_api_key)
         self._batch_worker.file_started.connect(self._on_batch_file_started)
         self._batch_worker.file_module_started.connect(self._on_module_started)
         self._batch_worker.file_module_done.connect(self._on_module_done)
