@@ -581,6 +581,87 @@ Berikan analisis dalam HANYA JSON valid:
     }
 
 
+def format_ai_summary(result: dict, target: str = '', findings: list = None,
+                      fmt: str = 'md') -> str:
+    """Ubah hasil executive summary AI menjadi teks (markdown / plain / html)."""
+    findings = findings or []
+    now     = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    name    = Path(target).name if target else '-'
+    try:
+        size = f'{Path(target).stat().st_size/1_048_576:.1f} MB' if target else '-'
+    except OSError:
+        size = '-'
+
+    score       = result.get('risk_score', 0)
+    verdict     = result.get('verdict', '?')
+    app_type    = result.get('app_type', '') or '-'
+    summary     = result.get('summary', '') or '-'
+    concerns    = result.get('top_concerns', []) or []
+    remediation = result.get('remediation', []) or []
+
+    if fmt == 'html':
+        color = {'AMAN':'#1a9e6e','MENCURIGAKAN':'#b8860b',
+                 'BERBAHAYA':'#d32f2f'}.get(verdict, '#555')
+        esc = lambda s: (str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;'))
+        parts = [
+            '<!DOCTYPE html><html lang="id"><head><meta charset="utf-8">',
+            f'<title>Rangkuman AI — {esc(name)}</title>',
+            '<style>body{font-family:Segoe UI,Arial,sans-serif;max-width:820px;'
+            'margin:32px auto;padding:0 20px;color:#1a2536;line-height:1.6}'
+            'h1{font-size:20px}h2{font-size:14px;color:#2a3f58;margin-top:24px}'
+            '.verdict{font-size:18px;font-weight:700;font-family:Consolas,monospace}'
+            '.meta{color:#6b7c90;font-size:13px}ul{padding-left:20px}'
+            'code{background:#f0f3f7;padding:2px 5px;border-radius:4px}</style></head><body>',
+            f'<h1>ZWinScan — Rangkuman AI</h1>',
+            f'<p class="meta">Target: <code>{esc(name)}</code> ({esc(size)}) &middot; '
+            f'{len(findings)} temuan &middot; {now}</p>',
+            f'<p class="verdict" style="color:{color}">[{esc(score)}/10] {esc(verdict)} '
+            f'&middot; {esc(app_type)}</p>',
+            f'<h2>RINGKASAN</h2><p>{esc(summary)}</p>',
+        ]
+        if concerns:
+            parts.append('<h2>TOP CONCERNS</h2><ul>' +
+                         ''.join(f'<li>{esc(c)}</li>' for c in concerns) + '</ul>')
+        if remediation:
+            parts.append('<h2>REKOMENDASI</h2><ol>' +
+                         ''.join(f'<li>{esc(r)}</li>' for r in remediation) + '</ol>')
+        parts.append('</body></html>')
+        return '\n'.join(parts)
+
+    # markdown / plain text (markdown adalah plain-text yang tetap terbaca)
+    L = []
+    if fmt == 'md':
+        L += [
+            '# ZWinScan — Rangkuman AI', '',
+            f'- **Target:** `{name}` ({size})',
+            f'- **Temuan:** {len(findings)}',
+            f'- **Dibuat:** {now}', '',
+            f'## Verdict: [{score}/10] {verdict} — {app_type}', '',
+            '## Ringkasan', '', summary, '',
+        ]
+        if concerns:
+            L += ['## Top Concerns', ''] + [f'- {c}' for c in concerns] + ['']
+        if remediation:
+            L += ['## Rekomendasi', ''] + \
+                 [f'{i+1}. {r}' for i, r in enumerate(remediation)] + ['']
+    else:  # txt
+        bar = '=' * 52
+        L += [
+            bar, ' ZWinScan — Rangkuman AI', bar,
+            f'Target  : {name} ({size})',
+            f'Temuan  : {len(findings)}',
+            f'Dibuat  : {now}', '',
+            f'VERDICT : [{score}/10] {verdict} - {app_type}', '',
+            'RINGKASAN', '-' * 9, summary, '',
+        ]
+        if concerns:
+            L += ['TOP CONCERNS', '-' * 12] + [f'  - {c}' for c in concerns] + ['']
+        if remediation:
+            L += ['REKOMENDASI', '-' * 11] + \
+                 [f'  {i+1}. {r}' for i, r in enumerate(remediation)] + ['']
+    return '\n'.join(L)
+
+
 # =========================================================
 # HTML Report
 # =========================================================
@@ -1573,6 +1654,7 @@ class MainWindow(QWidget):
         self._mod_rows     = {}
         self._html_out     = ''
         self._findings     = []
+        self._ai_summary    = None
         self._chat_history  = []
         self._chat_context  = ''
         self._scan_start_time = 0.0
@@ -1867,6 +1949,19 @@ class MainWindow(QWidget):
         ai_card_lo.addWidget(self.ai_remediation_lbl)
 
         ai_lo.addWidget(self.ai_card)
+
+        self.ai_export_btn = QPushButton("Ekspor Rangkuman AI")
+        self.ai_export_btn.setFixedHeight(38)
+        self.ai_export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ai_export_btn.setStyleSheet("""
+            QPushButton { background:#0b1628; color:#7a9ab8; border:1px solid #1e3a5f;
+                          border-radius:6px; font-size:12px; font-weight:600; padding:8px; }
+            QPushButton:hover { color:#00dcb4; border-color:#00dcb4; }
+        """)
+        self.ai_export_btn.setToolTip("Simpan rangkuman AI ke file (Markdown / Teks / HTML)")
+        self.ai_export_btn.clicked.connect(self._export_ai_summary)
+        ai_lo.addWidget(self.ai_export_btn)
+
         inner.addWidget(self.ai_panel)
 
         # ── AI Strings Panel ──────────────────────────────
@@ -2403,6 +2498,7 @@ class MainWindow(QWidget):
             self.ai_verdict_lbl.setText("⟳ Menunggu AI Executive Summary…")
 
     def _on_ai_summary(self, result: dict):
+        self._ai_summary = result
         score   = result.get('risk_score', 0)
         verdict = result.get('verdict', '?')
         app_type= result.get('app_type', '')
@@ -2426,6 +2522,47 @@ class MainWindow(QWidget):
                 'Rekomendasi:\n' + '\n'.join(f'  {i+1}. {r}' for i, r in enumerate(remediation)))
 
         self.ai_panel.setVisible(True)
+
+    def _export_ai_summary(self):
+        from PyQt6.QtWidgets import QMessageBox
+        if not self._ai_summary:
+            QMessageBox.information(self, "ZWinScan",
+                                    "Belum ada rangkuman AI untuk diekspor.")
+            return
+
+        base = Path(self._target).stem if self._target else 'zwinscan'
+        default = str(_LOG_DIR / f'{base}_rangkuman_ai.md')
+        path, sel = QFileDialog.getSaveFileName(
+            self, "Ekspor Rangkuman AI", default,
+            "Markdown (*.md);;Teks (*.txt);;HTML (*.html)")
+        if not path:
+            return
+
+        ext = Path(path).suffix.lower()
+        fmt = {'.md': 'md', '.txt': 'txt', '.html': 'html', '.htm': 'html'}.get(ext)
+        if fmt is None:  # tanpa ekstensi → ikuti filter yang dipilih
+            fmt = 'txt' if 'Teks' in sel else ('html' if 'HTML' in sel else 'md')
+            path += {'md': '.md', 'txt': '.txt', 'html': '.html'}[fmt]
+
+        try:
+            content = format_ai_summary(self._ai_summary, self._target,
+                                        self._findings, fmt)
+            Path(path).write_text(content, encoding='utf-8')
+        except OSError as e:
+            log.error(f'Export AI summary error: {e}')
+            QMessageBox.critical(self, "ZWinScan", f"Gagal menyimpan file:\n{e}")
+            return
+
+        log.info(f'AI summary exported: {path}')
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("ZWinScan")
+        box.setText(f"Rangkuman AI tersimpan:\n{path}")
+        open_btn = box.addButton("Buka File", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Tutup", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _on_ai_strings(self, result: dict):
         suspicious = result.get('suspicious', [])
