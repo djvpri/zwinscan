@@ -1,0 +1,60 @@
+name: build-and-scan
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write         # buat/attach Release
+  security-events: write  # upload SARIF ke tab Security
+
+jobs:
+  build-scan:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip pyinstaller pefile colorama google-genai PyQt6
+
+      - name: Build ZWinScan.exe
+        run: python -m PyInstaller zwinscan_gui.spec --clean --noconfirm
+
+      - name: Self-scan (SARIF + JSON)
+        # Dogfooding: scan exe hasil build dengan CLI ZWinScan.
+        # Tanpa --fail-on, jadi temuan tidak menggagalkan build (hanya dilaporkan).
+        run: python zwinscan_gui.py scan dist/ZWinScan.exe --sarif zwinscan.sarif --json zwinscan.json --quiet
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: zwinscan.sarif
+          category: zwinscan-self-scan
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zwinscan-${{ github.sha }}
+          path: |
+            dist/ZWinScan.exe
+            zwinscan.json
+            zwinscan.sarif
+          if-no-files-found: error
+
+      - name: Attach exe to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ZWinScan.exe
