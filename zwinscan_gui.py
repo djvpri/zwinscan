@@ -117,6 +117,22 @@ from PyQt6.QtGui import (
 
 SEV_ORDER = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3, 'INFO': 4}
 
+# Urutan modul scan (dipakai GUI worker & CLI) — method diresolve via getattr.
+SCAN_MODULES = [
+    ('PE Security Flags', 'check_pe_flags'),
+    ('Import Table',      'check_imports'),
+    ('Exploitability',    'check_exploitability'),
+    ('VirusTotal',        'check_virustotal'),
+    ('Section Entropy',   'check_section_entropy'),
+    ('Compile Timestamp', 'check_compile_timestamp'),
+    ('Digital Signature', 'check_signature'),
+    ('UAC & Manifest',    'check_uac_manifest'),
+    ('Hardcoded Secrets', 'check_hardcoded_secrets'),
+    ('URL & Network',     'check_urls'),
+    ('Network / SSO',     'check_network'),
+    ('Credential Files',  'check_credential_files'),
+]
+
 @dataclass
 class Finding:
     severity: str
@@ -1111,20 +1127,7 @@ class ScanWorker(QThread):
         log.info(f'Scan started: {self.target}')
         try:
             scanner = ZWinScanner(self.target, self.vt_api_key)
-            modules = [
-                ('PE Security Flags',  scanner.check_pe_flags),
-                ('Import Table',       scanner.check_imports),
-                ('Exploitability',     scanner.check_exploitability),
-                ('VirusTotal',         scanner.check_virustotal),
-                ('Section Entropy',    scanner.check_section_entropy),
-                ('Compile Timestamp',  scanner.check_compile_timestamp),
-                ('Digital Signature',  scanner.check_signature),
-                ('UAC & Manifest',     scanner.check_uac_manifest),
-                ('Hardcoded Secrets',  scanner.check_hardcoded_secrets),
-                ('URL & Network',      scanner.check_urls),
-                ('Network / SSO',      scanner.check_network),
-                ('Credential Files',   scanner.check_credential_files),
-            ]
+            modules = [(name, getattr(scanner, m)) for name, m in SCAN_MODULES]
             t0 = time.time()
             prev = 0
             for name, fn in modules:
@@ -1206,20 +1209,7 @@ class BatchScanWorker(QThread):
     def run(self):
         log.info(f'Batch scan: {len(self.targets)} files')
         results = []
-        MODULES = [
-            ('PE Security Flags', 'check_pe_flags'),
-            ('Import Table',      'check_imports'),
-            ('Exploitability',    'check_exploitability'),
-            ('VirusTotal',        'check_virustotal'),
-            ('Section Entropy',   'check_section_entropy'),
-            ('Compile Timestamp', 'check_compile_timestamp'),
-            ('Digital Signature', 'check_signature'),
-            ('UAC & Manifest',    'check_uac_manifest'),
-            ('Hardcoded Secrets', 'check_hardcoded_secrets'),
-            ('URL & Network',     'check_urls'),
-            ('Network / SSO',     'check_network'),
-            ('Credential Files',  'check_credential_files'),
-        ]
+        MODULES = SCAN_MODULES
         for idx, target in enumerate(self.targets):
             name = Path(target).name
             self.file_started.emit(name, idx + 1, len(self.targets))
@@ -2867,6 +2857,168 @@ def _qt_message_handler(mode, context, message):
     level_map.get(mode, log.warning)(f'[Qt] {message}')
 
 
+# =========================================================
+# CLI / headless mode + JSON & SARIF export
+# =========================================================
+
+def _finding_dicts(findings) -> list:
+    return [{'severity': f.severity, 'category': f.category,
+             'title': f.title, 'detail': f.detail}
+            for f in sorted(findings, key=lambda x: SEV_ORDER.get(x.severity, 9))]
+
+
+def save_json(findings, target, out, ai_summary=None, sha256='', duration=''):
+    p = Path(target)
+    counts = {}
+    for f in findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    try:
+        size = p.stat().st_size
+    except OSError:
+        size = None
+    doc = {
+        'tool': 'ZWinScan',
+        'schema': 'zwinscan-report/1',
+        'generated': datetime.datetime.now().isoformat(timespec='seconds'),
+        'duration': duration,
+        'target': {'name': p.name, 'path': str(p), 'size_bytes': size, 'sha256': sha256},
+        'summary': {'total': len(findings), 'by_severity': counts},
+        'findings': _finding_dicts(findings),
+        'ai_summary': ai_summary,
+    }
+    Path(out).write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding='utf-8')
+
+
+def save_sarif(findings, target, out):
+    """SARIF 2.1.0 — siap dipakai di GitHub Code Scanning / CI."""
+    sev2level = {'CRITICAL': 'error', 'HIGH': 'error',
+                 'MEDIUM': 'warning', 'LOW': 'note', 'INFO': 'note'}
+    uri = Path(target).as_uri() if target else ''
+    rules, rule_idx = [], {}
+    for f in findings:
+        if f.category not in rule_idx:
+            rule_idx[f.category] = len(rules)
+            rules.append({'id': f.category,
+                          'name': re.sub(r'\s+', '', f.category),
+                          'shortDescription': {'text': f'ZWinScan: {f.category}'}})
+    results = []
+    for f in sorted(findings, key=lambda x: SEV_ORDER.get(x.severity, 9)):
+        text = f.title + (f'\n\n{f.detail}' if f.detail else '')
+        results.append({
+            'ruleId': f.category,
+            'ruleIndex': rule_idx[f.category],
+            'level': sev2level.get(f.severity, 'note'),
+            'message': {'text': text},
+            'properties': {'severity': f.severity},
+            'locations': [{'physicalLocation': {
+                'artifactLocation': {'uri': uri}}}] if uri else [],
+        })
+    doc = {
+        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',
+        'version': '2.1.0',
+        'runs': [{
+            'tool': {'driver': {
+                'name': 'ZWinScan',
+                'informationUri': 'https://github.com/djvpri/zwinscan',
+                'rules': rules,
+            }},
+            'results': results,
+        }],
+    }
+    Path(out).write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding='utf-8')
+
+
+def run_cli(argv) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog='zwinscan', description='ZWinScan — analisis keamanan .exe Windows (headless).')
+    sub = ap.add_subparsers(dest='cmd')
+    sp = sub.add_parser('scan', help='Scan sebuah .exe dan ekspor laporan.')
+    sp.add_argument('target', help='Path file .exe')
+    sp.add_argument('--json',  metavar='PATH', help='Tulis laporan JSON')
+    sp.add_argument('--sarif', metavar='PATH', help='Tulis laporan SARIF 2.1.0 (CI)')
+    sp.add_argument('--html',  metavar='PATH', help='Tulis laporan HTML')
+    sp.add_argument('--vt-key',     default=None, help='VirusTotal API key (override config)')
+    sp.add_argument('--gemini-key', default=None, help='Gemini API key (override config)')
+    sp.add_argument('--ai', action='store_true', help='Sertakan executive summary AI (butuh Gemini key)')
+    sp.add_argument('--fail-on', default='none',
+                    choices=['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO', 'none'],
+                    help='Exit code 2 bila ada temuan pada level ini atau lebih parah (default: none)')
+    sp.add_argument('--quiet', action='store_true', help='Jangan cetak ringkasan ke stdout')
+    args = ap.parse_args(argv)
+
+    if args.cmd != 'scan':
+        ap.print_help()
+        return 0
+
+    target = args.target
+    if not Path(target).is_file():
+        print(f'error: file tidak ditemukan: {target}', file=sys.stderr)
+        return 1
+
+    cfg = _load_config()
+    vt_key     = args.vt_key     if args.vt_key     is not None else cfg.get('vt_api_key', '')
+    gemini_key = args.gemini_key if args.gemini_key is not None else cfg.get('gemini_api_key', '')
+
+    scanner = ZWinScanner(target, vt_key)
+    t0 = time.time()
+    for name, method in SCAN_MODULES:
+        if not args.quiet:
+            print(f'  · {name} ...', file=sys.stderr)
+        try:
+            getattr(scanner, method)()
+        except Exception as e:
+            log.error(f'CLI module {name} error: {e}')
+    duration = f'{time.time() - t0:.1f}s'
+    findings = scanner.findings
+
+    try:
+        sha256 = hashlib.sha256(Path(target).read_bytes()).hexdigest()
+    except OSError:
+        sha256 = ''
+
+    ai_summary = None
+    if args.ai:
+        if gemini_key and HAS_GENAI:
+            try:
+                exe_size = f'{Path(target).stat().st_size/1_048_576:.1f} MB'
+                ai_summary = ai_executive_summary(gemini_key, findings, Path(target).stem, exe_size)
+            except Exception as e:
+                log.error(f'CLI AI summary error: {e}')
+                print(f'warning: AI summary gagal: {e}', file=sys.stderr)
+        else:
+            print('warning: --ai diminta tapi Gemini key/library tidak tersedia', file=sys.stderr)
+
+    if args.json:
+        save_json(findings, target, args.json, ai_summary, sha256, duration)
+    if args.sarif:
+        save_sarif(findings, target, args.sarif)
+    if args.html:
+        save_html(findings, target, args.html, duration)
+
+    counts = {}
+    for f in findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    if not args.quiet:
+        print(f'\nZWinScan — {Path(target).name}  ({duration})')
+        print(f'SHA-256: {sha256}')
+        order = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']
+        print('  ' + '  '.join(f'{s}:{counts.get(s,0)}' for s in order)
+              + f'  (total {len(findings)})')
+        if ai_summary:
+            print(f'AI: [{ai_summary.get("risk_score","?")}/10] '
+                  f'{ai_summary.get("verdict","?")} — {ai_summary.get("summary","")}')
+        for out in (args.json, args.sarif, args.html):
+            if out:
+                print(f'  → {out}')
+
+    if args.fail_on != 'none':
+        thr = SEV_ORDER[args.fail_on]
+        if any(SEV_ORDER.get(f.severity, 9) <= thr for f in findings):
+            return 2
+    return 0
+
+
 def main():
     from PyQt6.QtCore import qInstallMessageHandler
     qInstallMessageHandler(_qt_message_handler)
@@ -2886,4 +3038,8 @@ def main():
 
 
 if __name__ == '__main__':
+    # Mode CLI headless bila dipanggil dengan subcommand 'scan' (atau help/version);
+    # tanpa argumen → GUI seperti biasa (termasuk saat exe di-double-click).
+    if len(sys.argv) > 1 and sys.argv[1] in ('scan', '-h', '--help'):
+        sys.exit(run_cli(sys.argv[1:]))
     main()
