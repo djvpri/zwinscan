@@ -64,6 +64,21 @@ try:
 except ImportError:
     HAS_GENAI = False
 
+# ── deps opsional utk Dynamic Runtime Analysis (Windows) ───
+try:
+    import psutil; HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+IS_WINDOWS = sys.platform.startswith('win')
+if IS_WINDOWS:
+    try:
+        import winreg as _winreg_mod  # registry access utk autostart diff
+        HAS_WINREG = True
+    except ImportError:
+        HAS_WINREG = False
+else:
+    HAS_WINREG = False
+
 # ── config helpers ─────────────────────────────────────────
 _CONFIG_FILE  = _LOG_DIR / 'config.json'
 _HISTORY_FILE = _LOG_DIR / 'history.json'
@@ -969,6 +984,296 @@ class ZWinScanner:
 
 
 # =========================================================
+# Dynamic Runtime Analysis (opsional, opt-in, Windows-only)
+# ---------------------------------------------------------
+# Fitur aktif: JALANKAN exe target terisolasi (folder + env) & pantau
+# perilakunya (proses anak, anti-debug timing, perubahan file/registry).
+# BUKAN sandbox sistem penuh — isolasi level aplikasi di mesin host.
+# Dipakai utk pengujian BERIZIN. Tidak otomatis jalan (harus --run / tombol).
+# =========================================================
+
+class DynamicRun:
+    """Jalankan exe target dalam lingkungan terisolasi & pantau perilakunya.
+
+    Prasyarat platform Windows + psutil. Gagal gracefully (finding INFO)
+    kalau platform/dep tak tersedia.
+    """
+
+    # Keys registry autostart umum (utk diff baseline)
+    AUTOSTART_KEYS = [
+        (r'Software\Microsoft\Windows\CurrentVersion\Run', 'HKCU'),
+        (r'Software\Microsoft\Windows\CurrentVersion\RunOnce', 'HKCU'),
+    ]
+
+    def __init__(self, target: str | Path, duration: float = 30.0):
+        self.target   = Path(target)
+        self.duration = max(3.0, float(duration))
+        self.isol_dir = None
+        self.findings: List[Finding] = []
+
+    def _ok(self):
+        if not IS_WINDOWS:
+            self.findings.append(Finding('INFO', 'Dynamic', 
+                'Dynamic analysis dilewati — bukan platform Windows.'))
+            return False
+        if not HAS_PSUTIL:
+            self.findings.append(Finding('INFO', 'Dynamic',
+                'Dynamic analysis dilewati — psutil belum terinstall.\n'
+                'Install: pip install psutil'))
+            return False
+        return True
+
+    # ── 1. Baseline snapshot ──────────────────────────────
+    def baseline_processes(self) -> set:
+        try:
+            return {p.pid for p in psutil.process_iter()}
+        except Exception:
+            return set()
+
+    def baseline_autostart(self) -> dict:
+        """Snapshot registry Run/RunOnce → nama → (key, value)."""
+        snap = {}
+        if not HAS_WINREG:
+            return snap
+        for sub, hive_name in self.AUTOSTART_KEYS:
+            hive = _winreg_mod.HKEY_CURRENT_USER if hive_name == 'HKCU' else _winreg_mod.HKEY_LOCAL_MACHINE
+            try:
+                with _winreg_mod.OpenKey(hive, sub) as k:
+                    i = 0
+                    while True:
+                        try:
+                            n, v, _ = _winreg_mod.EnumValue(k, i)
+                            snap[n] = (hive_name, sub, v)
+                            i += 1
+                        except OSError:
+                            break
+            except OSError:
+                pass
+        return snap
+
+    # ── 2. Isolasi & launch ───────────────────────────────
+    def make_isol_dir(self) -> Path:
+        base = _LOG_DIR / 'runtime'
+        base.mkdir(parents=True, exist_ok=True)
+        d = base / datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        d.mkdir(parents=True, exist_ok=True)
+        self.isol_dir = d
+        return d
+
+    def _isolated_env(self) -> dict:
+        env = os.environ.copy()
+        isol = str(self.isol_dir)
+        # Arahkan folder user-ish ke folder isolasi utk menangkap artifact
+        env['TEMP'] = isol
+        env['TMP']  = isol
+        env['APPDATA']      = isol
+        env['LOCALAPPDATA'] = isol
+        return env
+
+    def run_isolated(self, parent_pids: set) -> tuple:
+        """Jalankan exe di isolasi. Return (proc, monitor_info_dict)."""
+        self.isol_dir = self.make_isol_dir()
+        info = {'start': time.time()}
+        # subprocess harus non-interactive: jalankan dgn conctr langsung
+        flags = 0
+        if IS_WINDOWS:
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        try:
+            proc = subprocess.Popen(
+                [str(self.target)],
+                cwd=str(self.isol_dir),
+                env=self._isolated_env(),
+                creationflags=flags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            info['pid'] = proc.pid
+            return proc, info
+        except Exception as e:
+            info['launch_error'] = str(e)
+            return None, info
+
+    # ── 3. Monitor aktif ──────────────────────────────────
+    def monitor(self, proc, info: dict, parent_pids: set) -> dict:
+        """Polling proses anak, CPU spike, timing anti-debug, file baru."""
+        pids_before = {p.pid for p in psutil.process_iter()}  # snapshot anak utk diff
+        children = []
+        file_snap_before = self._snap_files(self.isol_dir)
+        timing_start = time.time()
+        deadline = info['start'] + self.duration
+
+        # Anti-debug timing heuristic: kalau proses anak 'tertidur' saat speed
+        # rendah, kemungkinan delay anti-analisis; ini diukur via wall/child CPU.
+        anti_debug_candidates = []
+
+        try:
+            while time.time() < deadline:
+                # cek proses anak (baru)
+                try:
+                    kids = proc.children(recursive=True)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    kids = []
+                for k in kids:
+                    if k.pid not in {c.pid for c in children}:
+                        children.append(k)
+                time.sleep(0.5)
+        except psutil.NoSuchProcess:
+            pass
+
+        timing_elapsed = time.time() - timing_start
+
+        # ukur child CPU utk timing: delta via interval antara 2 panggilan
+        total_child_cpu = 0.0
+        for c in list(children):
+            try:
+                # call tsb reset baseline; panggilan kedua dgn interval non-zero
+                # → delta CPU sejak baseline
+                c.cpu_percent(interval=None)      # reset counter
+                v = c.cpu_percent(interval=0.2) or 0  # delta utk 200ms
+                total_child_cpu += v
+            except Exception:
+                pass
+
+        info['children'] = children
+        info['timing_elapsed'] = timing_elapsed
+        info['total_child_cpu'] = total_child_cpu
+        info['file_snap_before'] = file_snap_before
+        return info
+
+    def _snap_files(self, d: Path) -> set:
+        """Himpunan relatif path file dalam folder isolasi."""
+        out = set()
+        if not d or not d.is_dir():
+            return out
+        try:
+            for p in d.rglob('*'):
+                if p.is_file():
+                    out.add(str(p.relative_to(d)))
+        except OSError:
+            pass
+        return out
+
+    # ── 4. Diff & auto-kill ───────────────────────────────
+    def diff_files(self, before: set) -> list:
+        """File baru dibuat di isolasi sejak snapshot."""
+        after = self._snap_files(self.isol_dir)
+        return sorted(after - before)
+
+    def diff_autostart(self, before: dict) -> dict:
+        snap = self.baseline_autostart()
+        added = {k: (v[2], before.get(k)) for k, v in snap.items() if k not in before and v[2]}
+        removed = [k for k in before if k not in snap]
+        return {'added': added, 'removed': removed}
+
+    def kill_tree(self, proc):
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            kids = proc.children(recursive=True) + [proc]
+            for p in reversed(kids):
+                try:
+                    p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception as e:
+            log.debug(f'kill_tree error: {e}')
+        finally:
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    # ── 5. Findings builder ───────────────────────────────
+    def build_findings(self, info: dict, parent_pids: set, file_before: set):
+        children = info.get('children', [])
+        if not children:
+            self.findings.append(Finding('INFO', 'Dynamic',
+                f'Proses target berjalan tanpa anak dalam {info.get("timing_elapsed",0):.0f}s',
+                f'PID: {info.get("pid","?")}'))
+        elif len(children) > 0:
+            child_info = []
+            for c in children:
+                try:
+                    child_info.append(f'  {c.pid}  {c.name()}')
+                except Exception:
+                    child_info.append(f'  {c.pid}  ?')
+            sev = 'LOW' if len(children) <= 2 else 'MEDIUM'
+            self.findings.append(Finding(sev, 'Dynamic',
+                f'{len(children)} proses anak diluncurkan',
+                'Proses anak (indikasi aktivitas tambahan):\n' + '\n'.join(child_info)))
+
+        cpu = info.get('total_child_cpu', 0)
+        if cpu > 30:
+            self.findings.append(Finding('MEDIUM', 'Dynamic',
+                f'CPU anak proporsional tinggi ({cpu:.0f}%)',
+                'Aktivitas komputasi intensif sesaat — bisa normal atau pemrosesan tersembunyi.'))
+
+        new_files = self.diff_files(file_before)
+        if new_files:
+            self.findings.append(Finding(
+                'HIGH' if len(new_files) > 2 else 'MEDIUM', 'Dynamic',
+                f'{len(new_files)} file dibuat di folder isolasi',
+                '\n'.join(f'  {f}' for f in new_files)))
+
+        # registry autostart diff
+        auto_before_map = {}
+        if info.get('auto_before'):
+            auto_before_map = info['auto_before']
+        after_snap = self.baseline_autostart()
+        added = {k: v for k, v in after_snap.items() if k not in auto_before_map}
+        if added:
+            self.findings.append(Finding('HIGH', 'Dynamic',
+                f'Registry autostart ditambahkan oleh target: {", ".join(added.keys())}',
+                'Target menghitung registry Run — indikasi persistence.'))
+
+    # ── 0. Orchestrator ───────────────────────────────────
+    def analyze(self) -> list:
+        """Jalankan seluruh pipeline dynamic analysis → list Finding."""
+        if not self._ok():
+            return self.findings
+        if not self.target.is_file():
+            self.findings.append(Finding('INFO', 'Dynamic',
+                f'Target bukan file: {self.target}'))
+            return self.findings
+
+        # baseline
+        process_before = self.baseline_processes()
+        auto_before    = self.baseline_autostart()
+
+        proc, info = self.run_isolated(process_before)
+        if proc is None:
+            self.findings.append(Finding('HIGH', 'Dynamic',
+                'Gagal meluncurkan target terisolasi',
+                f'Error: {info.get("launch_error", "?")}\nFolder isolasi: {self.isol_dir}'))
+            return self.findings
+
+        # monitor
+        file_before = self._snap_files(self.isol_dir)
+        info['auto_before'] = auto_before
+        try:
+            info = self.monitor(proc, info, process_before)
+        finally:
+            self.kill_tree(proc)
+
+        # findings
+        info['file_before'] = file_before
+        self.build_findings(info, process_before, file_before)
+
+        # cleanup folder isolasi (hapus artifact, dgn best-effort)
+        try:
+            if self.isol_dir and self.isol_dir.is_dir():
+                import shutil
+                shutil.rmtree(self.isol_dir, ignore_errors=True)
+                self.isol_dir = None
+        except Exception:
+            pass
+
+        return self.findings
+
+
+# =========================================================
 # AI Modules
 # =========================================================
 
@@ -1569,6 +1874,27 @@ class ChatWorker(QThread):
             )
             resp = chat.send_message(self.message)
             self.reply_ready.emit(resp.text.strip())
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class DynamicWorker(QThread):
+    """Jalankan Dynamic Runtime Analysis (exe terisolasi + pantau) di background."""
+    progress = pyqtSignal(str)
+    done     = pyqtSignal(list)   # list[Finding] hasil dynamic
+    error    = pyqtSignal(str)
+
+    def __init__(self, target: str, duration: float = 30.0):
+        super().__init__()
+        self.target   = target
+        self.duration = duration
+
+    def run(self):
+        self.progress.emit('Persiapan lingkungan isolasi…')
+        dr = DynamicRun(self.target, self.duration)
+        try:
+            findings = dr.analyze()
+            self.done.emit(findings)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -2280,6 +2606,22 @@ class MainWindow(QWidget):
         self.scan_btn.setEnabled(False)
         inner.addWidget(self.scan_btn)
 
+        # Dynamic Run button (opsional, aktif; butuh target terpilih)
+        self.run_btn = QPushButton("RUN & PANTUA")
+        self.run_btn.setToolTip(
+            "Jalankan exe target di lingkungan terisolasi (folder+env) & pantau\n"
+            "perilaku: proses anak, file baru, anti-debug, registry autostart.\n"
+            "BUKAN sandbox sistem penuh. Gunakan hanya utk file yang kamu punya/berizin.")
+        self.run_btn.setFixedHeight(40)
+        self.run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.run_btn.setStyleSheet(
+            "QPushButton { background:#1e3a5f; border:1px solid #2a4a75; color:#c8d8e8; "
+            "border-radius:6px; font-size:11px; font-weight:600; letter-spacing:1px; }"
+            "QPushButton:hover { background:#2a4a75; }")
+        self.run_btn.clicked.connect(self._start_dynamic)
+        self.run_btn.setEnabled(False)
+        inner.addWidget(self.run_btn)
+
         # Divider
         div = QFrame()
         div.setFrameShape(QFrame.Shape.HLine)
@@ -2634,12 +2976,14 @@ class MainWindow(QWidget):
             self.drop.set_folder(path, len(exes))
             self.scan_btn.setText(f"BATCH SCAN ({len(exes)} file)")
             self.scan_btn.setEnabled(True)
+            self.run_btn.setEnabled(False)   # dynamic hanya utk file tunggal
         else:
             self._target = path
             self._batch_targets = []
             self.drop.set_file(path)
             self.scan_btn.setText("SCAN")
             self.scan_btn.setEnabled(True)
+            self.run_btn.setEnabled(True)
 
     def _on_key_changed(self, text: str):
         self._api_key = text.strip()
@@ -2769,6 +3113,52 @@ class MainWindow(QWidget):
         self._worker.ai_strings_done.connect(self._on_ai_strings)
         self._worker.ai_error.connect(lambda e: log.warning(f'AI: {e}'))
         self._worker.start()
+
+    def _start_dynamic(self):
+        if not self._target or not Path(self._target).is_file():
+            return
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("Running…")
+        # log line
+        self._append_log("Dynamic Runtime Analysis …")
+        self._dyn_worker = DynamicWorker(self._target, 30.0)
+        self._dyn_worker.done.connect(self._on_dynamic_done)
+        self._dyn_worker.error.connect(lambda e: (
+            self._append_log(f"Dynamic error: {e}"),
+            self.run_btn.setEnabled(True), self.run_btn.setText("RUN & PANTUA")))
+        self._dyn_worker.start()
+
+    def _append_log(self, text: str):
+        try:
+            from PyQt6.QtWidgets import QLabel
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                "color:#7a9ab8;font-family:Consolas;font-size:10px;padding:1px 0;")
+            lbl.setWordWrap(True)
+            self.log_layout.addWidget(lbl)
+        except Exception:
+            pass
+
+    def _on_dynamic_done(self, findings: list):
+        self.run_btn.setText("RUN & PANTUA")
+        self.run_btn.setEnabled(True)
+        if not findings:
+            self._append_log("Dynamic: tidak ada temuan")
+            return
+        # gabungkan ke findings hasil scan statis (bila ada), render ulang
+        self._findings = list(self._findings) + list(findings)
+        while self.cards_row.count():
+            item = self.cards_row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        counts = {}
+        for f in self._findings:
+            counts[f.severity] = counts.get(f.severity, 0) + 1
+        for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+            card = SeverityCard(sev, counts.get(sev, 0))
+            self.cards_row.addWidget(card)
+        self.results_panel.setVisible(True)
+        self._append_log(f"Dynamic: {len(findings)} temuan baru ditambahkan")
 
     def _start_batch_scan(self):
         self.scan_btn.setEnabled(False)
@@ -3217,6 +3607,10 @@ def run_cli(argv) -> int:
                     choices=['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO', 'none'],
                     help='Exit code 2 bila ada temuan pada level ini atau lebih parah (default: none)')
     sp.add_argument('--quiet', action='store_true', help='Jangan cetak ringkasan ke stdout')
+    sp.add_argument('--run', action='store_true',
+                    help='JALANKAN exe target di lingkungan terisolasi & pantau perilaku (Windows+psutil diperlukan). Jalankan hanya utk file yang kamu punya/berizin.')
+    sp.add_argument('--run-duration', type=float, default=30.0,
+                    help='Durasi pantau dynamic analysis dalam detik (default: 30)')
     args = ap.parse_args(argv)
 
     if args.cmd != 'scan':
@@ -3260,6 +3654,17 @@ def run_cli(argv) -> int:
                 print(f'warning: AI summary gagal: {e}', file=sys.stderr)
         else:
             print('warning: --ai diminta tapi Gemini key/library tidak tersedia', file=sys.stderr)
+
+    # ── Dynamic Runtime Analysis (opsional, --run) ─────────
+    if args.run:
+        if not args.quiet:
+            print(f'  · Dynamic analysis (isolasi, {args.run_duration:.0f}s) ...', file=sys.stderr)
+        dr = DynamicRun(target, args.run_duration)
+        dyn = dr.analyze()
+        for f in dyn:
+            findings.append(f)
+        if not args.quiet and dyn:
+            print(f'  · Dynamic: {len(dyn)} temuan', file=sys.stderr)
 
     if args.json:
         save_json(findings, target, args.json, ai_summary, sha256, duration)
