@@ -3555,7 +3555,7 @@ def save_sarif(findings, target, out):
     """SARIF 2.1.0 — siap dipakai di GitHub Code Scanning / CI."""
     sev2level = {'CRITICAL': 'error', 'HIGH': 'error',
                  'MEDIUM': 'warning', 'LOW': 'note', 'INFO': 'note'}
-    uri = Path(target).as_uri() if target else ''
+    uri = Path(target).resolve().as_uri() if target else ''
     rules, rule_idx = [], {}
     for f in findings:
         if f.category not in rule_idx:
